@@ -56,20 +56,23 @@ export SEMANTIC_SCHOLAR_API_KEY=...   # optional
 | `.txt` (or no extension) | one DOI per line / scanned from text |
 | bare DOI argument | taken as-is |
 
-Author/year/title columns are picked up when present (used for filenames and
-the sidecar). **When they're missing** — a plain DOI list, or a spreadsheet
-without an author column — paperforge looks them up from OpenAlex (falling back
-to Crossref) so files are named e.g. `0007_Vaswani_2017.pdf` instead of
-`0007_Unknown_Unknown.pdf`. Disable with `--no-metadata`. DOIs wrapped as
-`https://doi.org/...` or `doi:...` are normalized automatically.
+Files are named in citation style, `<Author><Year>.pdf` (e.g.
+`Vaswani2017.pdf`). Author/year/title columns are used when present;
+**when they're missing** — a plain DOI list, or a spreadsheet without an
+author column — paperforge looks them up from OpenAlex (falling back to
+Crossref) so you get `Vaswani2017.pdf` instead of `Unknown.pdf`. Disable the
+lookup with `--no-metadata`. Two different papers that map to the same name get
+a `-2`, `-3` … suffix; re-downloading the same DOI overwrites its file in
+place. DOIs wrapped as `https://doi.org/...` or `doi:...` are normalized
+automatically.
 
 ### Output
 
 ```
 out/
   pdfs/
-    0001_Smith_2021.pdf
-    0001_Smith_2021.json     # source, license, version, all attempts
+    Vaswani2017.pdf
+    Vaswani2017.json         # source, license, version, all attempts
   manifest.csv               # index, doi, status, source, license, filename, error
 ```
 

@@ -38,6 +38,10 @@ def test_first_author_token():
 
 
 def test_generate_filename():
-    assert generate_filename(7, "Smith, John", "2021-01") == "0007_Smith_2021.pdf"
-    assert generate_filename(1, "", "") == "0001_Unknown_Unknown.pdf"
-    assert generate_filename(12, "Łukasz", "2020").endswith("_2020.pdf")
+    assert generate_filename("Smith, John", "2021-01") == "Smith2021.pdf"
+    assert generate_filename("Vaswani", "2017") == "Vaswani2017.pdf"
+    assert generate_filename("Vaswani", "") == "Vaswani.pdf"
+    assert generate_filename("", "2017") == "2017.pdf"
+    assert generate_filename("", "") == "Unknown.pdf"
+    assert generate_filename("Unknown", "Unknown") == "Unknown.pdf"
+    assert generate_filename("Łukasz", "2020").endswith("2020.pdf")

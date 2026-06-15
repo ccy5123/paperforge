@@ -382,7 +382,7 @@ class OADownloader:
             # Fill in author/year/title from OpenAlex/Crossref when the caller
             # didn't supply them, so files aren't all named Unknown_Unknown.
             author, year, title = self._enrich(doi, author, year, title)
-            pdf_path, filename = self._save(content, res, index, author, year, title, attempts)
+            pdf_path, filename = self._save(content, res, author, year, title, attempts)
             kb = len(content) / 1024
             self.log(f"✓ [{res.source}] {filename}  ({kb:.1f} KB, license={res.license or '?'})")
             return DownloadOutcome(
@@ -457,14 +457,40 @@ class OADownloader:
         finally:
             r.close()
 
-    def _save(self, content: bytes, res: Resolution, index: int,
+    @staticmethod
+    def _unique_path(out_dir: Path, base: str, doi: str) -> Path:
+        """Resolve <out_dir>/<base>.pdf, avoiding clobbering a *different* paper.
+
+        Re-saving the same DOI reuses its existing name; a collision with a
+        different DOI (same author+year) gets a ``-2``, ``-3`` … suffix.
+        """
+        base = base or "Unknown"
+        n = 1
+        candidate = base
+        while True:
+            pdf_path = out_dir / f"{candidate}.pdf"
+            if not pdf_path.exists():
+                return pdf_path
+            sidecar = pdf_path.with_suffix(".json")
+            if sidecar.exists():
+                try:
+                    prev = json.loads(sidecar.read_text(encoding="utf-8"))
+                    if (prev.get("doi") or "").lower() == (doi or "").lower():
+                        return pdf_path        # same paper → overwrite in place
+                except (ValueError, OSError):
+                    pass
+            n += 1
+            candidate = f"{base}-{n}"
+
+    def _save(self, content: bytes, res: Resolution,
               author: str, year: str, title: str,
               attempts: list[Resolution]) -> tuple[Path, str]:
         out_dir = Path(self.config.output_dir) / "pdfs"
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        filename = generate_filename(index, author, year)
-        pdf_path = out_dir / filename
+        base = generate_filename(author, year, ext="")
+        pdf_path = self._unique_path(out_dir, base, res.doi)
+        filename = pdf_path.name
         pdf_path.write_bytes(content)
 
         sidecar_path = pdf_path.with_suffix(".json")

@@ -98,8 +98,9 @@ def test_fetch_writes_pdf_and_sidecar(monkeypatch, tmp_path):
     )
     outcome = d.fetch("10.48550/arxiv.2301.12345", 1, "Smith", "2021", "Title")
     assert outcome.ok and outcome.source == "arxiv"
-    assert (tmp_path / "pdfs" / "0001_Smith_2021.pdf").exists()
-    assert (tmp_path / "pdfs" / "0001_Smith_2021.json").exists()
+    assert outcome.filename == "Smith2021.pdf"
+    assert (tmp_path / "pdfs" / "Smith2021.pdf").exists()
+    assert (tmp_path / "pdfs" / "Smith2021.json").exists()
 
 
 def test_fetch_enriches_filename_when_metadata_missing(monkeypatch, tmp_path):
@@ -117,7 +118,8 @@ def test_fetch_enriches_filename_when_metadata_missing(monkeypatch, tmp_path):
     monkeypatch.setattr(d.session, "get", fake_get)
     outcome = d.fetch("10.48550/arxiv.1706.03762", 1, "", "", "")   # no author/year given
     assert outcome.ok
-    assert (tmp_path / "pdfs" / "0001_Vaswani_2017.pdf").exists()
+    assert outcome.filename == "Vaswani2017.pdf"
+    assert (tmp_path / "pdfs" / "Vaswani2017.pdf").exists()
 
 
 def test_no_metadata_flag_disables_lookup(monkeypatch, tmp_path):
@@ -131,5 +133,24 @@ def test_no_metadata_flag_disables_lookup(monkeypatch, tmp_path):
     monkeypatch.setattr(d.session, "get", fake_get)
     outcome = d.fetch("10.48550/arxiv.1706.03762", 1, "", "", "")
     assert outcome.ok
-    assert (tmp_path / "pdfs" / "0001_Unknown_Unknown.pdf").exists()
+    assert (tmp_path / "pdfs" / "Unknown.pdf").exists()
     assert all("openalex" not in u for u in seen)   # no metadata call made
+
+
+def test_filename_collision_disambiguates(monkeypatch, tmp_path):
+    d = make_downloader(output_dir=tmp_path)
+    monkeypatch.setattr(d.session, "get",
+                        lambda url, **kw: FakeResp(200, content=b"%PDF-1.7 data"))
+
+    # Two different DOIs, same author+year -> must not clobber each other.
+    o1 = d.fetch("10.48550/arxiv.1111.1", 1, "Smith", "2021", "")
+    o2 = d.fetch("10.48550/arxiv.2222.2", 2, "Smith", "2021", "")
+    assert o1.filename == "Smith2021.pdf"
+    assert o2.filename == "Smith2021-2.pdf"
+    assert (tmp_path / "pdfs" / "Smith2021.pdf").exists()
+    assert (tmp_path / "pdfs" / "Smith2021-2.pdf").exists()
+
+    # Re-saving the SAME DOI reuses its name (overwrite in place, no -3).
+    o3 = d.fetch("10.48550/arxiv.1111.1", 1, "Smith", "2021", "")
+    assert o3.filename == "Smith2021.pdf"
+    assert not (tmp_path / "pdfs" / "Smith2021-3.pdf").exists()

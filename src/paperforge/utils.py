@@ -68,11 +68,19 @@ def _slug(value: str, maxlen: int = 40) -> str:
     return _NON_ALNUM.sub("", value or "")[:maxlen]
 
 
-def generate_filename(index: int, author: str, year, ext: str = ".pdf") -> str:
-    """Stable, filesystem-safe name like ``0007_Smith_2021.pdf``.
+def _blank_if_unknown(value: str) -> str:
+    value = (value or "").strip()
+    return "" if value.lower() == "unknown" else value
 
-    ``index`` guarantees uniqueness; author/year are for human readability only.
+
+def generate_filename(author: str, year, ext: str = ".pdf") -> str:
+    """Citation-style name from author + year, e.g. ``Vaswani2017.pdf``.
+
+    Either part may be missing (``Vaswani.pdf`` / ``2017.pdf``); falls back to
+    ``Unknown`` when both are. Collision handling is the caller's job at save
+    time, since uniqueness now depends on what's already on disk.
     """
-    a = _slug(first_author_token(author)) or "Unknown"
-    y = _slug(clean_year(year)) or _slug(str(year)) or "Unknown"
-    return f"{int(index):04d}_{a}_{y}{ext}"
+    a = _slug(first_author_token(_blank_if_unknown(author)))
+    y = _slug(clean_year(year)) or _slug(_blank_if_unknown(str(year)))
+    base = f"{a}{y}"
+    return f"{base or 'Unknown'}{ext}"
