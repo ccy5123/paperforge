@@ -56,9 +56,12 @@ export SEMANTIC_SCHOLAR_API_KEY=...   # optional
 | `.txt` (or no extension) | one DOI per line / scanned from text |
 | bare DOI argument | taken as-is |
 
-Author/year/title columns are picked up when present (used only for filenames
-and the sidecar). DOIs wrapped as `https://doi.org/...` or `doi:...` are
-normalized automatically.
+Author/year/title columns are picked up when present (used for filenames and
+the sidecar). **When they're missing** — a plain DOI list, or a spreadsheet
+without an author column — paperforge looks them up from OpenAlex (falling back
+to Crossref) so files are named e.g. `0007_Vaswani_2017.pdf` instead of
+`0007_Unknown_Unknown.pdf`. Disable with `--no-metadata`. DOIs wrapped as
+`https://doi.org/...` or `doi:...` are normalized automatically.
 
 ### Output
 
@@ -84,6 +87,7 @@ are retried automatically.
 | `--require-known-license` | with `--licenses`, also drop PDFs of unknown license |
 | `--source-order ...` | reorder/limit the resolver chain |
 | `--overwrite` | re-download DOIs already recorded as success |
+| `--no-metadata` | skip the OpenAlex/Crossref lookup used to name files |
 | `-v, --verbose` | debug logging |
 
 ## Library use

@@ -38,6 +38,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "(arxiv,unpaywall,openalex,europepmc,semantic_scholar)")
     p.add_argument("--overwrite", action="store_true",
                    help="re-download DOIs already marked success in the manifest")
+    p.add_argument("--no-metadata", action="store_true",
+                   help="don't look up author/year from OpenAlex/Crossref for filenames")
     p.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     return p
 
@@ -64,6 +66,7 @@ def main(argv=None) -> int:
         require_known_license=args.require_known_license or None,
         source_order=_split_csv(args.source_order),
         overwrite=args.overwrite or None,
+        enrich_metadata=(False if args.no_metadata else None),
     )
 
     if not config.unpaywall_email:

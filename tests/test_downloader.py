@@ -100,3 +100,36 @@ def test_fetch_writes_pdf_and_sidecar(monkeypatch, tmp_path):
     assert outcome.ok and outcome.source == "arxiv"
     assert (tmp_path / "pdfs" / "0001_Smith_2021.pdf").exists()
     assert (tmp_path / "pdfs" / "0001_Smith_2021.json").exists()
+
+
+def test_fetch_enriches_filename_when_metadata_missing(monkeypatch, tmp_path):
+    d = make_downloader(output_dir=tmp_path)
+
+    def fake_get(url, **kw):
+        if "openalex.org" in url:
+            return FakeResp(200, json_data={
+                "authorships": [{"author": {"display_name": "Ashish Vaswani"}}],
+                "publication_year": 2017,
+                "title": "Attention Is All You Need",
+            })
+        return FakeResp(200, content=b"%PDF-1.7 data")
+
+    monkeypatch.setattr(d.session, "get", fake_get)
+    outcome = d.fetch("10.48550/arxiv.1706.03762", 1, "", "", "")   # no author/year given
+    assert outcome.ok
+    assert (tmp_path / "pdfs" / "0001_Vaswani_2017.pdf").exists()
+
+
+def test_no_metadata_flag_disables_lookup(monkeypatch, tmp_path):
+    d = make_downloader(output_dir=tmp_path, enrich_metadata=False)
+    seen = []
+
+    def fake_get(url, **kw):
+        seen.append(url)
+        return FakeResp(200, content=b"%PDF-1.7 data")
+
+    monkeypatch.setattr(d.session, "get", fake_get)
+    outcome = d.fetch("10.48550/arxiv.1706.03762", 1, "", "", "")
+    assert outcome.ok
+    assert (tmp_path / "pdfs" / "0001_Unknown_Unknown.pdf").exists()
+    assert all("openalex" not in u for u in seen)   # no metadata call made

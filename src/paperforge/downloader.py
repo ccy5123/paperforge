@@ -40,6 +40,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from .metadata import Metadata, fetch_metadata
 from .utils import generate_filename, normalize_doi
 
 
@@ -295,6 +296,7 @@ class OADownloader:
         self.logger = None
         self.session = self._build_session(config)
         self._chain = self._resolve_chain(config)
+        self._md_cache: dict[str, Metadata] = {}
 
     # ---- construction ------------------------------------------------
 
@@ -377,6 +379,9 @@ class OADownloader:
             if not ok:
                 continue
 
+            # Fill in author/year/title from OpenAlex/Crossref when the caller
+            # didn't supply them, so files aren't all named Unknown_Unknown.
+            author, year, title = self._enrich(doi, author, year, title)
             pdf_path, filename = self._save(content, res, index, author, year, title, attempts)
             kb = len(content) / 1024
             self.log(f"✓ [{res.source}] {filename}  ({kb:.1f} KB, license={res.license or '?'})")
@@ -397,6 +402,17 @@ class OADownloader:
         return self.fetch(doi, index, author, year, title).ok
 
     # ---- internals ---------------------------------------------------
+
+    def _enrich(self, doi: str, author: str, year: str, title: str):
+        """Return (author, year, title), filling gaps from a metadata lookup."""
+        if not getattr(self.config, "enrich_metadata", True):
+            return author, year, title
+        if author and year:
+            return author, year, title
+        if doi not in self._md_cache:
+            self._md_cache[doi] = fetch_metadata(doi, self.session, self.config)
+        md = self._md_cache[doi]
+        return author or md.author, year or md.year, title or md.title
 
     def _license_ok(self, res: Resolution) -> bool:
         allowed = getattr(self.config, "allowed_licenses", None)
