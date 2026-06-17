@@ -40,6 +40,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="re-download DOIs already marked success in the manifest")
     p.add_argument("--no-metadata", action="store_true",
                    help="don't look up author/year from OpenAlex/Crossref for filenames")
+    p.add_argument("--no-bib", action="store_true",
+                   help="don't generate references.bib (DOI->BibTeX via doi.org)")
     p.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     return p
 
@@ -67,6 +69,7 @@ def main(argv=None) -> int:
         source_order=_split_csv(args.source_order),
         overwrite=args.overwrite or None,
         enrich_metadata=(False if args.no_metadata else None),
+        generate_bib=(False if args.no_bib else None),
     )
 
     if not config.unpaywall_email:
@@ -98,6 +101,8 @@ def main(argv=None) -> int:
     result = processor.run(records)
     log.info(result.summary())
     log.info("Manifest: %s", processor.manifest_path)
+    if config.generate_bib:
+        log.info("Bibliography: %s", processor.bib_path)
     return 0 if result.failed == 0 else 1
 
 
