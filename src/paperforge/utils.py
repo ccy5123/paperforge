@@ -1,7 +1,9 @@
 """Shared helpers: DOI normalization/extraction and safe filename generation."""
 from __future__ import annotations
 
+import itertools
 import re
+import string
 
 # A permissive DOI matcher (Crossref-style). Case-insensitive.
 DOI_RE = re.compile(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+", re.IGNORECASE)
@@ -84,3 +86,13 @@ def generate_filename(author: str, year, ext: str = ".pdf") -> str:
     y = _slug(clean_year(year)) or _slug(_blank_if_unknown(str(year)))
     base = f"{a}{y}"
     return f"{base or 'Unknown'}{ext}"
+
+
+def collision_suffixes():
+    """Disambiguation suffixes for name/key collisions: ``a, b, …, z, aa, ab, …``.
+
+    Shared by PDF filenames and BibTeX keys so the two stay in lock-step.
+    """
+    for n in itertools.count(1):
+        for combo in itertools.product(string.ascii_lowercase, repeat=n):
+            yield "".join(combo)

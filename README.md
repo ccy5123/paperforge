@@ -62,9 +62,9 @@ Files are named in citation style, `<Author><Year>.pdf` (e.g.
 author column — paperforge looks them up from OpenAlex (falling back to
 Crossref) so you get `Vaswani2017.pdf` instead of `Unknown.pdf`. Disable the
 lookup with `--no-metadata`. Two different papers that map to the same name get
-a `-2`, `-3` … suffix; re-downloading the same DOI overwrites its file in
-place. DOIs wrapped as `https://doi.org/...` or `doi:...` are normalized
-automatically.
+an `a`/`b`/… suffix (the same scheme as the bib keys, so PDF name and cite key
+stay in step); re-downloading the same DOI overwrites its file in place. DOIs
+wrapped as `https://doi.org/...` or `doi:...` are normalized automatically.
 
 ### Output
 

@@ -29,6 +29,7 @@ Optional config attributes:
 """
 from __future__ import annotations
 
+import itertools
 import json
 import re
 from dataclasses import asdict, dataclass, field
@@ -41,7 +42,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from .metadata import Metadata, fetch_metadata
-from .utils import generate_filename, normalize_doi
+from .utils import collision_suffixes, generate_filename, normalize_doi
 
 
 def _enc(doi: str) -> str:
@@ -462,13 +463,12 @@ class OADownloader:
         """Resolve <out_dir>/<base>.pdf, avoiding clobbering a *different* paper.
 
         Re-saving the same DOI reuses its existing name; a collision with a
-        different DOI (same author+year) gets a ``-2``, ``-3`` … suffix.
+        different DOI (same author+year) gets an ``a``/``b``/… suffix — the same
+        scheme BibTeX keys use, so the PDF name and its cite key stay in step.
         """
         base = base or "Unknown"
-        n = 1
-        candidate = base
-        while True:
-            pdf_path = out_dir / f"{candidate}.pdf"
+        for suffix in itertools.chain([""], collision_suffixes()):
+            pdf_path = out_dir / f"{base}{suffix}.pdf"
             if not pdf_path.exists():
                 return pdf_path
             sidecar = pdf_path.with_suffix(".json")
@@ -479,8 +479,7 @@ class OADownloader:
                         return pdf_path        # same paper → overwrite in place
                 except (ValueError, OSError):
                     pass
-            n += 1
-            candidate = f"{base}-{n}"
+        raise AssertionError("unreachable: collision_suffixes is infinite")
 
     def _save(self, content: bytes, res: Resolution,
               author: str, year: str, title: str,

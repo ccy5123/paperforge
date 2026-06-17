@@ -11,15 +11,13 @@ with ``a``/``b``/… suffixes on collision so every key is unique.
 """
 from __future__ import annotations
 
-import itertools
 import re
-import string
 from dataclasses import dataclass, field
 from typing import Optional
 
 import requests
 
-from .utils import clean_year, generate_filename, normalize_doi
+from .utils import clean_year, collision_suffixes, generate_filename, normalize_doi
 
 # A single content-negotiation response is one entry: @type{key, field = ...}
 _ENTRY_RE = re.compile(r"@(\w+)\s*\{\s*([^,]*?)\s*,(.*)\}\s*\Z", re.DOTALL)
@@ -147,13 +145,6 @@ def rekey(raw: str, new_key: str) -> str:
     return _KEY_RE.sub(lambda m: f"{m.group(1)}{new_key},", raw.strip(), count=1)
 
 
-def _suffixes():
-    """a, b, …, z, aa, ab, … — unbounded collision suffixes."""
-    for n in itertools.count(1):
-        for combo in itertools.product(string.ascii_lowercase, repeat=n):
-            yield "".join(combo)
-
-
 # ---------------------------------------------------------------------------
 # Accumulation
 # ---------------------------------------------------------------------------
@@ -197,7 +188,7 @@ class BibCollection:
         stem = stem or "Unknown"
         if stem not in self._used_keys:
             return stem
-        for suffix in _suffixes():
+        for suffix in collision_suffixes():
             candidate = stem + suffix
             if candidate not in self._used_keys:
                 return candidate

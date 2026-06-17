@@ -146,11 +146,11 @@ def test_filename_collision_disambiguates(monkeypatch, tmp_path):
     o1 = d.fetch("10.48550/arxiv.1111.1", 1, "Smith", "2021", "")
     o2 = d.fetch("10.48550/arxiv.2222.2", 2, "Smith", "2021", "")
     assert o1.filename == "Smith2021.pdf"
-    assert o2.filename == "Smith2021-2.pdf"
+    assert o2.filename == "Smith2021a.pdf"          # letter suffix, matching bib keys
     assert (tmp_path / "pdfs" / "Smith2021.pdf").exists()
-    assert (tmp_path / "pdfs" / "Smith2021-2.pdf").exists()
+    assert (tmp_path / "pdfs" / "Smith2021a.pdf").exists()
 
-    # Re-saving the SAME DOI reuses its name (overwrite in place, no -3).
+    # Re-saving the SAME DOI reuses its name (overwrite in place, no new entry).
     o3 = d.fetch("10.48550/arxiv.1111.1", 1, "Smith", "2021", "")
     assert o3.filename == "Smith2021.pdf"
-    assert not (tmp_path / "pdfs" / "Smith2021-3.pdf").exists()
+    assert not (tmp_path / "pdfs" / "Smith2021b.pdf").exists()
