@@ -31,6 +31,7 @@ class Config:
     # --- batch behavior ---
     overwrite: bool = False            # re-download DOIs already marked success in the manifest
     enrich_metadata: bool = True       # look up author/year/title for filenames when missing
+    generate_bib: bool = True          # emit references.bib (DOI->BibTeX via doi.org) for the run
 
     def __post_init__(self) -> None:
         self.output_dir = Path(self.output_dir)

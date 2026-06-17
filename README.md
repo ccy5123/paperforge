@@ -62,9 +62,9 @@ Files are named in citation style, `<Author><Year>.pdf` (e.g.
 author column — paperforge looks them up from OpenAlex (falling back to
 Crossref) so you get `Vaswani2017.pdf` instead of `Unknown.pdf`. Disable the
 lookup with `--no-metadata`. Two different papers that map to the same name get
-a `-2`, `-3` … suffix; re-downloading the same DOI overwrites its file in
-place. DOIs wrapped as `https://doi.org/...` or `doi:...` are normalized
-automatically.
+an `a`/`b`/… suffix (the same scheme as the bib keys, so PDF name and cite key
+stay in step); re-downloading the same DOI overwrites its file in place. DOIs
+wrapped as `https://doi.org/...` or `doi:...` are normalized automatically.
 
 ### Output
 
@@ -73,12 +73,29 @@ out/
   pdfs/
     Vaswani2017.pdf
     Vaswani2017.json         # source, license, version, all attempts
-  manifest.csv               # index, doi, status, source, license, filename, error
+  manifest.csv               # index, doi, status, source, license, filename, bib, error
+  references.bib             # full BibTeX for the input DOIs (surname+year keys)
 ```
 
 `manifest.csv` makes runs **resumable**: a DOI already marked `success` is
 skipped on the next run (use `--overwrite` to force a re-download). Failures
 are retried automatically.
+
+### Bibliography (`references.bib`)
+
+paperforge also emits a `references.bib` so a downstream paper can `\cite{...}`
+the batch with no hand-authoring. For each DOI it requests the registrar's
+canonical BibTeX via **doi.org content negotiation** (`Accept:
+application/x-bibtex`) — it never fabricates entries. Notes:
+
+- **Every input DOI is attempted**, not just OA-PDF successes — a paywalled
+  classic still gets cited. (Bib availability ≠ PDF availability.)
+- Each entry's key is rewritten to the **same `<Surname><Year>` stem as the PDF
+  filename** (e.g. `Vaswani2017`), with `a`/`b`/… on collision. Keys are unique
+  and entries are sorted deterministically.
+- A DOI whose BibTeX can't be resolved is recorded (`bib=miss` in the manifest,
+  a `% unresolved` comment in the file) and **omitted** — never synthesized.
+- Disable with `--no-bib`.
 
 ### Options
 
@@ -91,6 +108,7 @@ are retried automatically.
 | `--source-order ...` | reorder/limit the resolver chain |
 | `--overwrite` | re-download DOIs already recorded as success |
 | `--no-metadata` | skip the OpenAlex/Crossref lookup used to name files |
+| `--no-bib` | don't generate `references.bib` |
 | `-v, --verbose` | debug logging |
 
 ## Library use

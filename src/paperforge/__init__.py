@@ -1,4 +1,5 @@
 """paperforge — resolve DOIs to Open Access PDFs and download them in batch."""
+from .bibtex import BibCollection, BibEntry, fetch_bibtex
 from .config import Config
 from .downloader import DownloadOutcome, OADownloader, Resolution
 from .inputs import PaperRecord, load_many, load_records
@@ -16,4 +17,7 @@ __all__ = [
     "load_many",
     "BatchProcessor",
     "BatchResult",
+    "BibCollection",
+    "BibEntry",
+    "fetch_bibtex",
 ]

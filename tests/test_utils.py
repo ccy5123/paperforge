@@ -1,10 +1,21 @@
+import itertools
+
 from paperforge.utils import (
     clean_year,
+    collision_suffixes,
     extract_dois,
     first_author_token,
     generate_filename,
     normalize_doi,
 )
+
+
+def test_collision_suffixes_sequence():
+    got = list(itertools.islice(collision_suffixes(), 28))
+    assert got[:3] == ["a", "b", "c"]
+    assert got[25] == "z"
+    assert got[26] == "aa"
+    assert got[27] == "ab"
 
 
 def test_normalize_doi_strips_prefixes_and_junk():
