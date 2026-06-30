@@ -60,6 +60,12 @@ def main(argv=None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(message)s",
     )
+    # habanero's HTTP stack (httpx2/httpcore2) logs every request at INFO; that
+    # floods the batch output with "HTTP Request: GET ..." lines. Keep our own
+    # progress visible but quiet the transport unless the user asked for -v.
+    if not args.verbose:
+        for noisy in ("httpx", "httpx2", "httpcore", "httpcore2"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
     log = logging.getLogger("paperforge")
 
     licenses = _split_csv(args.licenses)
