@@ -34,19 +34,27 @@ error on the transitive `pylatexenc`, upgrade your build tools first:
 
 ## Usage
 
+paperforge's two jobs — downloading PDFs and building `references.bib` — are
+separate subcommands, so you run only the one you need:
+
 ```bash
-# A spreadsheet, a DOI list, and a bare DOI — all at once
-paperforge refs.xlsx dois.txt 10.1038/s41586-020-2649-2 \
+# references.bib only (fast; no PDF downloads)
+paperforge bib examples/dois.txt --email you@example.org -o ./out
+
+# Open Access PDFs only
+paperforge download refs.xlsx --email you@example.org -o ./out
+
+# both at once — a spreadsheet, a DOI list, and a bare DOI together
+paperforge all refs.xlsx dois.txt 10.1038/s41586-020-2649-2 \
     --email you@example.org -o ./out
 
-# Only redistributable Creative Commons PDFs
-paperforge refs.csv --email you@example.org --licenses cc-by,cc-by-sa,cc0
-
-# Just build references.bib, skip the PDF downloads (fast)
-paperforge examples/dois.txt --no-download --email you@example.org -o ./out
+# download-only options (PDF filtering) live on `download` and `all`
+paperforge download refs.csv --email you@example.org --licenses cc-by,cc-by-sa,cc0
 ```
 
-A ready-to-run DOI list lives at [`examples/dois.txt`](examples/dois.txt).
+Omitting the subcommand is treated as `all` for backward compatibility
+(`paperforge refs.xlsx --email …` still downloads **and** builds the bib). A
+ready-to-run DOI list lives at [`examples/dois.txt`](examples/dois.txt).
 
 Set the email once via the environment instead of repeating `--email`:
 
@@ -107,8 +115,8 @@ and mEDRA DOIs. It never fabricates entries. Notes:
   and entries are sorted deterministically.
 - A DOI whose BibTeX can't be resolved is recorded (`bib=miss` in the manifest,
   a `% unresolved` comment in the file) and **omitted** — never synthesized.
-- Disable with `--no-bib`, or keep the bib and skip the PDF phase with
-  `--no-download`.
+- Run it on its own with `paperforge bib …` (no PDF downloads), or alongside the
+  downloads with `paperforge all …`.
 
 #### LaTeX safety
 
@@ -131,18 +139,23 @@ pure, dependency-free string transform you can reuse on its own.
 
 ### Options
 
+Shared by every subcommand (`bib`, `download`, `all`):
+
 | Flag | Meaning |
 | --- | --- |
 | `-o, --output DIR` | output directory (default `paperforge_out`) |
-| `--email ADDR` | contact email for Unpaywall/OpenAlex (or `$UNPAYWALL_EMAIL`) |
+| `--email ADDR` | contact email for Unpaywall/OpenAlex/doi.org (or `$UNPAYWALL_EMAIL`) |
+| `-v, --verbose` | debug logging (also un-quiets the HTTP transport logs) |
+
+Only on `download` and `all` (they govern the PDF phase):
+
+| Flag | Meaning |
+| --- | --- |
 | `--licenses a,b,c` | only keep PDFs whose license matches one of these substrings |
 | `--require-known-license` | with `--licenses`, also drop PDFs of unknown license |
 | `--source-order ...` | reorder/limit the resolver chain |
 | `--overwrite` | re-download DOIs already recorded as success |
 | `--no-metadata` | skip the OpenAlex/Crossref lookup used to name files |
-| `--no-bib` | don't generate `references.bib` |
-| `--no-download` | skip OA PDF downloads; only build `references.bib` |
-| `-v, --verbose` | debug logging (also un-quiets the HTTP transport logs) |
 
 ## Library use
 
