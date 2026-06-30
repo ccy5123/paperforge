@@ -10,6 +10,7 @@ from paperforge.bibtex import (
     rekey,
 )
 from paperforge.config import Config
+from paperforge.latex_safety import find_residue, sanitize
 
 SAMPLE = (
     "@article{vaswani_2017_attention,\n"
@@ -112,44 +113,76 @@ def test_non_ascii_roundtrips_without_corruption():
     assert "Müller" in e.text
 
 
-# ---- thin network function: behavior is testable offline by injecting a session ----
+# ---- integrity layer wired into add(): seam is closed at storage time ------
 
-class _Resp:
-    def __init__(self, status, content=b""):
-        self.status_code = status
-        self.content = content
-
-
-class _Session:
-    def __init__(self, resp):
-        self._resp = resp
-        self.last = None
-        self.headers = {}
-
-    def get(self, url, **kw):
-        self.last = (url, kw)
-        return self._resp
+def test_add_sanitizes_entity_at_the_seam():
+    coll = BibCollection()
+    raw = ("@article{src, title={Environmental Science &amp; Technology}, "
+           "author={Doe, Jane}, year={2021}}")
+    e = coll.add("10.1021/es", raw)
+    assert "&amp;" not in e.text
+    assert "Environmental Science \\& Technology" in e.text
+    assert not find_residue(e.text)        # I6: stored entry is seam-closed
+    assert "&amp;" not in coll.render()
 
 
-def test_fetch_bibtex_sends_accept_header_and_decodes_utf8():
-    sess = _Session(_Resp(200, "@article{x, title={Ünïcøde}}".encode("utf-8")))
-    out = fetch_bibtex("10.1000/x", sess, Config(unpaywall_email="e@example.org"))
-    assert out.startswith("@article")
-    assert "Ünïcøde" in out
-    url, kw = sess.last
-    assert url == "https://doi.org/10.1000/x"
-    assert kw["headers"]["Accept"] == "application/x-bibtex"
-    assert "paperforge" in kw["headers"]["User-Agent"]
-    assert "e@example.org" in kw["headers"]["User-Agent"]
+def test_add_structural_identity_field_value_only():
+    """I2: only field *values* change; key, type, field names and counts stay."""
+    bibtexparser = pytest.importorskip("bibtexparser")
+    raw = ("@article{Doe2021, title={A &amp; B}, author={Doe, Jane}, "
+           "year={2021}, journal={X &amp; Y}}")
+    # sanitize in isolation is field-value-only and structurally identical
+    before = bibtexparser.parse_string(raw).entries[0]
+    after = bibtexparser.parse_string(sanitize(raw)).entries[0]
+    assert before.key == after.key
+    assert before.entry_type == after.entry_type
+    assert [f.key for f in before.fields] == [f.key for f in after.fields]
+    assert len(before.fields) == len(after.fields)
+    assert after["journal"] == "X \\& Y"   # the value, and only the value, changed
+
+    # and through the real add() path: stored entry parses with the same shape
+    coll = BibCollection()
+    e = coll.add("10.1/d", raw, author="Doe, Jane", year="2021")
+    stored = bibtexparser.parse_string(e.text).entries[0]
+    assert stored.entry_type == "article"
+    assert [f.key for f in stored.fields] == ["title", "author", "year", "journal"]
 
 
-def test_fetch_bibtex_non_200_is_miss():
-    assert fetch_bibtex("10.1000/x", _Session(_Resp(404)), Config()) is None
+def test_add_decimal_and_hex_entities_decode_at_seam():
+    coll = BibCollection()
+    raw = "@article{x, title={Don&#39;t &#x2019;quote&#x2019;}, author={A, B}, year={2020}}"
+    e = coll.add("10.1/q", raw)
+    assert "Don't" in e.text
+    assert "’quote’" in e.text
+    assert not find_residue(e.text)
 
 
-def test_fetch_bibtex_non_bibtex_body_is_miss():
-    sess = _Session(_Resp(200, b"<!DOCTYPE html><html>landing page</html>"))
-    assert fetch_bibtex("10.1000/x", sess, Config()) is None
+# ---- fetch_bibtex is now a thin delegate to the habanero-backed sourcing layer ----
+
+def test_fetch_bibtex_delegates_to_sourcing_and_returns_raw(monkeypatch):
+    import paperforge.bibtex as bibtex_mod
+    from paperforge.sourcing import SourcedEntry
+
+    seen = {}
+
+    def fake_sourced(doi, *, mailto):
+        seen["doi"] = doi
+        seen["mailto"] = mailto
+        return SourcedEntry(doi=doi, raw_bibtex="@article{x, title={Ünïcøde}}",
+                            agency=None, retrieved_at=__import__("datetime").datetime.now())
+
+    monkeypatch.setattr(bibtex_mod, "fetch_canonical_bibtex", fake_sourced)
+    out = fetch_bibtex("10.1000/x", None, Config(unpaywall_email="e@example.org"))
+    assert out == "@article{x, title={Ünïcøde}}"     # raw body passed straight through
+    assert seen["doi"] == "10.1000/x"
+    assert seen["mailto"] == "e@example.org"          # config email -> polite-pool mailto
+
+
+def test_fetch_bibtex_miss_returns_none(monkeypatch):
+    import paperforge.bibtex as bibtex_mod
+    monkeypatch.setattr(bibtex_mod, "fetch_canonical_bibtex",
+                        lambda doi, *, mailto: None)
+    assert fetch_bibtex("10.1000/x", None, Config()) is None
 
 
 # ---- one real-network smoke test, skipped unless explicitly enabled ----
@@ -159,8 +192,6 @@ def test_fetch_bibtex_non_bibtex_body_is_miss():
     reason="network test; set PAPERFORGE_NETWORK_TESTS=1 to run",
 )
 def test_smoke_real_doi_content_negotiation():
-    import requests
-
-    out = fetch_bibtex("10.1145/3292500.3330701", requests.Session(),
+    out = fetch_bibtex("10.1145/3292500.3330701", None,
                        Config(unpaywall_email="test@example.org"))
     assert out and out.lstrip().startswith("@")

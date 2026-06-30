@@ -1,9 +1,17 @@
 """DOI -> BibTeX via doi.org content negotiation.
 
 We *request* the registrar's canonical BibTeX (Crossref/DataCite/…) rather than
-constructing one, so we never fabricate bibliographic data. The network call is
-isolated in :func:`fetch_bibtex`; everything else (parsing, key rewriting,
-accumulation) is pure and unit-testable by injecting the raw BibTeX text.
+constructing one, so we never fabricate bibliographic data. Sourcing is owned by
+:mod:`paperforge.sourcing` (a habanero wrapper -- the single network boundary);
+everything here (parsing, key rewriting, accumulation) is pure and unit-testable
+by injecting the raw BibTeX text.
+
+The registrar body is XML-rooted, so it can arrive with HTML entities (``&amp;``)
+or bare LaTeX specials (``&``) that break ``pdflatex``/``bibtex``. Before an entry
+is stored it is run through :func:`paperforge.latex_safety.sanitize` and asserted
+seam-closed -- the transcoding step the raw body lacks. That transform touches
+only ``&`` and HTML entities, which never occur in a cite key or ``@type``, so it
+is provably field-value-only without reserializing the entry.
 
 Cite keys are rewritten to paperforge's citation style — ``<Surname><Year>`` —
 the same stem :func:`paperforge.utils.generate_filename` derives for PDF names,
@@ -15,8 +23,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
-import requests
-
+from .latex_safety import assert_seam_closed, sanitize
+from .sourcing import fetch_canonical_bibtex
 from .utils import clean_year, collision_suffixes, generate_filename, normalize_doi
 
 # A single content-negotiation response is one entry: @type{key, field = ...}
@@ -27,60 +35,26 @@ _KEY_RE = re.compile(r"^(@\w+\s*\{)\s*[^,]*?\s*,", re.DOTALL)
 @dataclass
 class BibEntry:
     key: str       # final, rekeyed citation key
-    text: str      # full entry with the key rewritten; body left as-returned
+    text: str      # full entry: key rewritten, body seam-closed (sanitized)
     doi: str
 
 
 # ---------------------------------------------------------------------------
-# Network (thin; inject raw text in tests instead of calling this)
+# Sourcing (thin delegate; inject raw text in tests instead of calling this)
 # ---------------------------------------------------------------------------
 
-def _decode(content: bytes) -> str:
-    """Decode BibTeX bytes, tolerating UTF-8 or latin-1 (never raises)."""
-    for enc in ("utf-8", "latin-1"):
-        try:
-            return content.decode(enc)
-        except UnicodeDecodeError:
-            continue
-    return content.decode("utf-8", errors="replace")
+def fetch_bibtex(doi: str, session=None, config=None) -> Optional[str]:
+    """Return the registrar's canonical BibTeX for *doi*, or ``None`` on a miss.
 
-
-def _user_agent(config, session) -> str:
-    ua = session.headers.get("User-Agent") if session is not None else None
-    if ua and "paperforge" in ua.lower():
-        return ua
-    email = getattr(config, "unpaywall_email", "") or "anonymous@example.org"
-    return f"paperforge/0.1 (mailto:{email})"
-
-
-def fetch_bibtex(doi: str, session: requests.Session, config,
-                 *, timeout=(10, 20), max_attempts: int = 3) -> Optional[str]:
-    """GET https://doi.org/<doi> with ``Accept: application/x-bibtex``.
-
-    Returns the raw BibTeX string, or ``None`` on any failure (network error,
-    non-200, or a body that isn't a BibTeX entry). Never raises; never
-    fabricates. ``max_attempts`` = 1 try + up to 2 retries on transient errors.
+    A thin delegate to :func:`paperforge.sourcing.fetch_canonical_bibtex`, which
+    owns the doi.org content negotiation (HTTP, etiquette, retries, multi-registrar
+    normalization) via habanero. ``session`` is accepted for call-site
+    compatibility but unused -- habanero owns the transport now. Never raises;
+    never fabricates.
     """
-    doi = normalize_doi(doi)
-    if not doi:
-        return None
-    url = "https://doi.org/" + requests.utils.quote(doi, safe="/")
-    headers = {
-        "Accept": "application/x-bibtex",
-        "User-Agent": _user_agent(config, session),
-    }
-    for attempt in range(max_attempts):
-        try:
-            r = session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
-        except requests.RequestException:
-            continue  # transient connection issue -> retry
-        if r.status_code == 200:
-            text = _decode(r.content).strip()
-            return text if text.startswith("@") else None
-        if r.status_code in (429, 500, 502, 503, 504) and attempt + 1 < max_attempts:
-            continue  # transient server state -> retry
-        return None   # 404 and other definitive misses
-    return None
+    mailto = getattr(config, "unpaywall_email", "") or ""
+    sourced = fetch_canonical_bibtex(doi, mailto=mailto)
+    return sourced.raw_bibtex if sourced is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +152,14 @@ class BibCollection:
         stem = cite_key_stem(author or _extract_field(body, "author"),
                              year or _year_from_body(body))
         final_key = self._unique_key(stem)
-        entry = BibEntry(key=final_key, text=rekey(raw, final_key).strip(), doi=doi)
+
+        # Close the XML/HTML-entity -> LaTeX transcoding seam *before* storing.
+        # Applied to the whole entry string: sanitize only touches ``&`` and HTML
+        # entities, which never appear in the cite key or ``@type``, so this is
+        # field-value-only (I2) without reserializing the registrar's formatting.
+        safe_text = sanitize(rekey(raw, final_key).strip())
+        assert_seam_closed(safe_text)
+        entry = BibEntry(key=final_key, text=safe_text, doi=doi)
 
         self._by_doi[key_doi or final_key] = entry
         self._used_keys.add(final_key)
