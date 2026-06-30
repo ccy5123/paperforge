@@ -16,6 +16,7 @@ venv/
 # paperforge output (PDFs, sidecars, manifest)
 paperforge_out/
 *_out/
+out/
 
 # local virtualenv
 .venv/
