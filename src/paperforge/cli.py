@@ -42,6 +42,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="don't look up author/year from OpenAlex/Crossref for filenames")
     p.add_argument("--no-bib", action="store_true",
                    help="don't generate references.bib (DOI->BibTeX via doi.org)")
+    p.add_argument("--no-download", action="store_true",
+                   help="skip OA PDF downloads; only build references.bib (bib-only run)")
     p.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     return p
 
@@ -58,6 +60,12 @@ def main(argv=None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(message)s",
     )
+    # habanero's HTTP stack (httpx2/httpcore2) logs every request at INFO; that
+    # floods the batch output with "HTTP Request: GET ..." lines. Keep our own
+    # progress visible but quiet the transport unless the user asked for -v.
+    if not args.verbose:
+        for noisy in ("httpx", "httpx2", "httpcore", "httpcore2"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
     log = logging.getLogger("paperforge")
 
     licenses = _split_csv(args.licenses)
@@ -70,6 +78,7 @@ def main(argv=None) -> int:
         overwrite=args.overwrite or None,
         enrich_metadata=(False if args.no_metadata else None),
         generate_bib=(False if args.no_bib else None),
+        download_pdfs=(False if args.no_download else None),
     )
 
     if not config.unpaywall_email:

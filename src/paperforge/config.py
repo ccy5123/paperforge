@@ -32,6 +32,7 @@ class Config:
     overwrite: bool = False            # re-download DOIs already marked success in the manifest
     enrich_metadata: bool = True       # look up author/year/title for filenames when missing
     generate_bib: bool = True          # emit references.bib (DOI->BibTeX via doi.org) for the run
+    download_pdfs: bool = True          # fetch OA PDFs; False => bib-only (skip the download phase)
 
     def __post_init__(self) -> None:
         self.output_dir = Path(self.output_dir)

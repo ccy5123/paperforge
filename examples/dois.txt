@@ -1,0 +1,24 @@
+# Example DOI list — environmental chemistry / QSAR / ecotoxicology.
+# One DOI per line; lines starting with '#' are ignored by the scanner.
+# Run (needs doi.org egress access):
+#   paperforge examples/dois.txt -o out/ --email you@example.org
+# This exercises the habanero sourcing path + LaTeX-safety seam across
+# multiple registrars (Crossref + DataCite). The first DOI is the known
+# `&amp;` case (container-title "QSAR &amp; Combinatorial Science").
+10.1002/qsar.200390023
+10.1139/a06-005
+10.1897/08-058.1
+10.1002/etc.5620200606
+10.1002/etc.1970
+10.1002/etc.5620090205
+10.1021/es301921w
+10.1093/inteam/vjae046
+10.1002/etc.5620060702
+10.1002/etc.2572
+10.1002/etc.5620200703
+10.1897/03-173
+10.1016/0045-6535(80)90150-2
+10.26434/chemrxiv.15002330/v1
+10.1371/journal.pcbi.1006100
+10.1021/es00139a013
+10.1021/es2043728
