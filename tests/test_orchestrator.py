@@ -123,6 +123,23 @@ def test_bib_fetch_exception_does_not_crash(tmp_path):
     assert res.succeeded == 1 and res.bib_misses == 1        # recorded null, no crash
 
 
+def test_no_download_skips_pdfs_but_still_writes_bib(tmp_path):
+    cfg = Config(unpaywall_email="t@e.org", output_dir=tmp_path, download_pdfs=False)
+    fake = FakeDownloader(succeed=True)
+    bp = BatchProcessor(
+        cfg, downloader=fake,
+        bib_fetcher=_bib_from({"10.1038/a":
+                               "@article{x, author={Smith, J}, year={2020}, title={A}}"}))
+    res = bp.run([PaperRecord(doi="10.1038/a")])
+    assert fake.calls == []                       # no PDF fetch attempted
+    assert res.succeeded == 0 and res.failed == 0
+    assert res.skipped == 1                        # counted as skipped this run
+    bib = (tmp_path / "references.bib").read_text(encoding="utf-8")
+    assert "@article{Smith2020," in bib            # bib still produced
+    rows = list(csv.DictReader(open(tmp_path / "manifest.csv", encoding="utf-8")))
+    assert rows[0]["status"] == "skipped" and rows[0]["bib"] == "ok"
+
+
 def test_no_bib_config_skips_file(tmp_path):
     cfg = Config(unpaywall_email="t@e.org", output_dir=tmp_path, generate_bib=False)
     bp = BatchProcessor(cfg, downloader=FakeDownloader(succeed=True),

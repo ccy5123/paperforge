@@ -121,6 +121,15 @@ class BatchProcessor:
                 result.skipped += 1
                 self.log(f"[{index:04d}] skip (already done): {rec.doi}", "DEBUG")
                 row = dict(prev)            # keep prior download result
+            elif not self.config.download_pdfs:
+                # bib-only run: skip the PDF download phase entirely, still key/bib below.
+                result.skipped += 1
+                self.log(f"[{index:04d}] bib-only (download skipped): {rec.doi}", "DEBUG")
+                row = {
+                    "index": index, "doi": rec.doi, "status": "skipped",
+                    "source": "", "license": "", "filename": "",
+                    "origin": rec.origin or "", "error": "",
+                }
             else:
                 outcome = self.downloader.fetch(rec.doi, index, rec.author,
                                                 rec.year, rec.title)
