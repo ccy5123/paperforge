@@ -5,6 +5,7 @@ make the entity/ampersand seam provably closed, minimal, and idempotent.
 """
 import random
 import string
+import unicodedata
 
 import pytest
 
@@ -16,6 +17,7 @@ from paperforge.latex_safety import (
     decode_entities,
     escape_specials,
     find_residue,
+    normalize_spaces,
     sanitize,
 )
 
@@ -58,6 +60,7 @@ def test_decode_entities_all_classes(raw, expect):
 def _rand_text(rng):
     pool = list(string.ascii_letters + "0123456789 .,&;#%{}\\$_^~<>'\"") + [
         "&amp;", "&lt;", "&gt;", "&#39;", "&#x2019;", "δ", "ë",
+        " ", " ", "​",   # exotic spaces / zero-width too
     ]
     return "".join(rng.choice(pool) for _ in range(rng.randint(0, 40)))
 
@@ -120,6 +123,49 @@ def test_sanitize_converts_markup_and_escapes_amp_together():
 def test_sanitize_handles_entity_encoded_markup():
     # Crossref occasionally serves the tags entity-encoded.
     assert sanitize("&lt;i&gt;abc&lt;/i&gt;") == r"\textit{abc}"
+
+
+# ---- non-standard Unicode spaces -> ASCII (inputenc utf8 compile safety) ----
+
+def test_normalize_spaces_unicode_separators_become_ascii():
+    # U+2005 FOUR-PER-EM SPACE, as Crossref encodes "Jon A." given names.
+    assert normalize_spaces("Jon A.") == "Jon A."
+    # a representative spread of Zs separators all fold to one ASCII space:
+    # NBSP, en/em quad, three/four-per-em, six-per-em, thin, hair, narrow NBSP.
+    for cp in (" ", " ", " ", " ", " ",
+               " ", " ", " ", " "):
+        assert normalize_spaces("a" + cp + "b") == "a b"
+
+
+def test_normalize_spaces_drops_zero_width():
+    assert normalize_spaces("a​b") == "ab"   # ZERO WIDTH SPACE
+    assert normalize_spaces("a‌b") == "ab"   # ZERO WIDTH NON-JOINER
+    assert normalize_spaces("a‍b") == "ab"   # ZERO WIDTH JOINER
+
+
+def test_normalize_spaces_preserves_dashes_accents_and_ascii():
+    assert normalize_spaces("337–345") == "337–345"   # en dash (Pd) kept
+    assert normalize_spaces("a—b") == "a—b"           # em dash (Pd) kept
+    assert normalize_spaces("Könemann ø ç") == "Könemann ø ç"   # accents untouched
+    assert normalize_spaces("plain  ascii spaces") == "plain  ascii spaces"
+
+
+def test_normalize_spaces_idempotent():
+    once = normalize_spaces("Jon A. Arnot​")
+    assert normalize_spaces(once) == once
+
+
+def test_sanitize_normalizes_nbsp_entity():
+    # &nbsp; decodes to U+00A0, then normalizes to a plain ASCII space.
+    assert sanitize("Jon&nbsp;A.") == "Jon A."
+
+
+def test_sanitize_repro_four_per_em_space_in_author():
+    out = sanitize("author = {Arnot, Jon A.}")
+    assert out == "author = {Arnot, Jon A.}"
+    # no Zs-but-not-ASCII-space character survives
+    leftover = [c for c in out if c != " " and unicodedata.category(c) == "Zs"]
+    assert leftover == []
 
 
 # ---- I6: seam-closed postcondition -----------------------------------------
