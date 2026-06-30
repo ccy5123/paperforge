@@ -27,7 +27,10 @@ winning source, license, version, and every attempt.
 pip install -e ".[dev]"     # editable, with test extras
 ```
 
-Requires Python ≥ 3.10. Runtime deps: `requests`, `openpyxl`.
+Requires Python ≥ 3.10. Runtime deps: `requests`, `openpyxl`, and
+`habanero[bibtex]` (DOI → BibTeX sourcing). If a fresh environment hits a build
+error on the transitive `pylatexenc`, upgrade your build tools first:
+`pip install -U pip setuptools wheel`.
 
 ## Usage
 
@@ -38,7 +41,12 @@ paperforge refs.xlsx dois.txt 10.1038/s41586-020-2649-2 \
 
 # Only redistributable Creative Commons PDFs
 paperforge refs.csv --email you@example.org --licenses cc-by,cc-by-sa,cc0
+
+# Just build references.bib, skip the PDF downloads (fast)
+paperforge examples/dois.txt --no-download --email you@example.org -o ./out
 ```
+
+A ready-to-run DOI list lives at [`examples/dois.txt`](examples/dois.txt).
 
 Set the email once via the environment instead of repeating `--email`:
 
@@ -65,6 +73,8 @@ lookup with `--no-metadata`. Two different papers that map to the same name get
 an `a`/`b`/… suffix (the same scheme as the bib keys, so PDF name and cite key
 stay in step); re-downloading the same DOI overwrites its file in place. DOIs
 wrapped as `https://doi.org/...` or `doi:...` are normalized automatically.
+Accented names are transliterated to ASCII rather than dropped, so *Könemann*
+becomes `Konemann2018` (not `Knemann2018`).
 
 ### Output
 
@@ -85,8 +95,10 @@ are retried automatically.
 
 paperforge also emits a `references.bib` so a downstream paper can `\cite{...}`
 the batch with no hand-authoring. For each DOI it requests the registrar's
-canonical BibTeX via **doi.org content negotiation** (`Accept:
-application/x-bibtex`) — it never fabricates entries. Notes:
+canonical BibTeX via **doi.org content negotiation** — sourcing is delegated to
+[habanero](https://github.com/sckott/habanero), which routes through doi.org and
+returns the **registrar-of-record's own** BibTeX, covering Crossref, DataCite,
+and mEDRA DOIs. It never fabricates entries. Notes:
 
 - **Every input DOI is attempted**, not just OA-PDF successes — a paywalled
   classic still gets cited. (Bib availability ≠ PDF availability.)
@@ -95,7 +107,27 @@ application/x-bibtex`) — it never fabricates entries. Notes:
   and entries are sorted deterministically.
 - A DOI whose BibTeX can't be resolved is recorded (`bib=miss` in the manifest,
   a `% unresolved` comment in the file) and **omitted** — never synthesized.
-- Disable with `--no-bib`.
+- Disable with `--no-bib`, or keep the bib and skip the PDF phase with
+  `--no-download`.
+
+#### LaTeX safety
+
+Registrar BibTeX is XML-rooted, so a field value can arrive with HTML entities
+(`Environmental Science &amp; Technology`), bare LaTeX specials (`&`), or inline
+HTML markup (`<i>Cyprinus carpio</i>`) — all of which break `pdflatex`/`bibtex`.
+Before an entry is stored, paperforge transcodes it at that seam:
+
+- HTML entities are decoded (`&amp;`/`&lt;`/`&#39;`/`&#x2019;` → `&`/`<`/`'`/’).
+- Bare `&` is escaped to `\&` (idempotent — an existing `\&` is left alone).
+- Predictable inline markup becomes LaTeX: `<i>`/`<em>` → `\textit{}`/`\emph{}`,
+  `<b>`/`<strong>` → `\textbf{}`, `<sub>`/`<sup>` → `\textsubscript{}`/
+  `\textsuperscript{}`, `<sc>` → `\textsc{}`, and so on.
+
+The transform is conservative (only field values change — never keys, types, or
+field names), minimal, and residue-checked: anything left at the entity/`&` seam
+is raised loudly rather than leaking into the file. Raw Unicode (`δ¹³C`,
+`Gonçalo`) is preserved as-is. This is the `paperforge.latex_safety` module, a
+pure, dependency-free string transform you can reuse on its own.
 
 ### Options
 
@@ -109,7 +141,8 @@ application/x-bibtex`) — it never fabricates entries. Notes:
 | `--overwrite` | re-download DOIs already recorded as success |
 | `--no-metadata` | skip the OpenAlex/Crossref lookup used to name files |
 | `--no-bib` | don't generate `references.bib` |
-| `-v, --verbose` | debug logging |
+| `--no-download` | skip OA PDF downloads; only build `references.bib` |
+| `-v, --verbose` | debug logging (also un-quiets the HTTP transport logs) |
 
 ## Library use
 
