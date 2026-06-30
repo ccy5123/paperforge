@@ -12,6 +12,7 @@ from paperforge.latex_safety import (
     DEFAULT_SPECIALS,
     SeamLeak,
     assert_seam_closed,
+    convert_markup,
     decode_entities,
     escape_specials,
     find_residue,
@@ -83,6 +84,42 @@ def test_minimality_no_amp_no_entity_is_identity():
 def test_minimality_only_amp_region_changes():
     out = sanitize("prefix δ13C & Daëron suffix")
     assert out == "prefix δ13C \\& Daëron suffix"
+
+
+# ---- HTML inline markup -> LaTeX commands ----------------------------------
+
+def test_convert_markup_known_inline_tags():
+    assert convert_markup("<i>Cyprinus carpio</i>") == r"\textit{Cyprinus carpio}"
+    assert convert_markup("<em>y</em>") == r"\emph{y}"
+    assert convert_markup("<b>x</b>") == r"\textbf{x}"
+    assert convert_markup("<strong>x</strong>") == r"\textbf{x}"
+    assert convert_markup("Fe<sub>3</sub>O<sub>4</sub>") == r"Fe\textsubscript{3}O\textsubscript{4}"
+    assert convert_markup("E<sup>2</sup>") == r"E\textsuperscript{2}"
+    assert convert_markup("<sc>dna</sc>") == r"\textsc{dna}"
+
+
+def test_convert_markup_case_insensitive_and_attributes():
+    assert convert_markup("<I>a</I>") == r"\textit{a}"
+    assert convert_markup('<i xmlns="x">a</i>') == r"\textit{a}"
+
+
+def test_convert_markup_nested():
+    assert convert_markup("<i><b>x</b></i>") == r"\textit{\textbf{x}}"
+
+
+def test_convert_markup_leaves_non_markup_alone():
+    assert convert_markup("a < b and c > d") == "a < b and c > d"   # bare angle brackets
+    assert convert_markup("<unknown>z</unknown>") == "<unknown>z</unknown>"  # unknown tag
+    assert convert_markup("<i>open only") == "<i>open only"          # unpaired
+
+
+def test_sanitize_converts_markup_and_escapes_amp_together():
+    assert sanitize("<i>Salmo &amp; trutta</i>") == r"\textit{Salmo \& trutta}"
+
+
+def test_sanitize_handles_entity_encoded_markup():
+    # Crossref occasionally serves the tags entity-encoded.
+    assert sanitize("&lt;i&gt;abc&lt;/i&gt;") == r"\textit{abc}"
 
 
 # ---- I6: seam-closed postcondition -----------------------------------------

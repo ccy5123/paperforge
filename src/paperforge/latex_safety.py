@@ -42,6 +42,26 @@ import re
 #               longer escape list.
 DEFAULT_SPECIALS = ("&",)
 
+# Crossref/JATS embeds a small, predictable set of inline HTML markup tags in
+# field values (titles especially). Map each well-formed pair to its LaTeX
+# command equivalent. This is the same decode-source/encode-target move as the
+# entity seam, one level up: HTML *markup* -> LaTeX *markup*. The set is closed
+# and justified; unknown tags are left untouched (see convert_markup).
+_MARKUP_CMD = {
+    "i": "textit", "em": "emph",
+    "b": "textbf", "strong": "textbf",
+    "sub": "textsubscript", "sup": "textsuperscript",
+    "sc": "textsc", "scp": "textsc",
+    "u": "underline",
+    "tt": "texttt", "monospace": "texttt",
+}
+# One well-formed pair: <tag ...> body </tag>, same tag name, non-greedy body.
+_MARKUP_RE = re.compile(
+    r"<(?P<tag>" + "|".join(sorted(_MARKUP_CMD, key=len, reverse=True)) +
+    r")\b[^>]*>(?P<body>.*?)</(?P=tag)>",
+    re.DOTALL | re.IGNORECASE,
+)
+
 # Residue patterns (I6). (a) any HTML-entity shape that should already be
 # decoded, and (b) any ``&`` not already escaped as ``\&``.
 _ENTITY_RE = re.compile(r"&[A-Za-z][A-Za-z0-9]*;|&#\d+;|&#x[0-9A-Fa-f]+;")
@@ -75,14 +95,37 @@ def escape_specials(text: str, specials=DEFAULT_SPECIALS) -> str:
     return text
 
 
+def convert_markup(text: str, _max_passes: int = 6) -> str:
+    """Rewrite well-formed inline HTML markup pairs to their LaTeX commands.
+
+    ``<i>x</i>`` -> ``\\textit{x}`` (and the rest of :data:`_MARKUP_CMD`).
+    Conservative and idempotent: only matched ``<tag>...</tag>`` pairs of a
+    *known* tag are converted, so bare angle brackets (``a < b``), unknown tags,
+    and unpaired tags are left untouched. Re-run on its own output is a no-op
+    (no tags remain). The bounded loop resolves nesting (``<i><b>x</b></i>``).
+    """
+    def _sub(m):
+        return "\\" + _MARKUP_CMD[m.group("tag").lower()] + "{" + m.group("body") + "}"
+
+    for _ in range(_max_passes):
+        new = _MARKUP_RE.sub(_sub, text)
+        if new == text:
+            break
+        text = new
+    return text
+
+
 def sanitize(text: str, specials=DEFAULT_SPECIALS) -> str:
     """Decode the source convention, then encode the target convention -- once.
 
-    ``sanitize == escape_specials ∘ decode_entities``. Idempotent (I1),
-    field-value-only (I2), minimal (I7), and (by construction + :func:`find_residue`)
-    seam-closing (I6).
+    ``sanitize == escape_specials ∘ convert_markup ∘ decode_entities``. Decoding
+    first means entity-encoded markup (``&lt;i&gt;``) is converted too. Idempotent
+    (I1), field-value-only (I2), minimal on the seam classes (I7), and (by
+    construction + :func:`find_residue`) entity/ampersand seam-closing (I6).
+    Markup conversion is best-effort (well-formed pairs only); it is not part of
+    the hard residue postcondition.
     """
-    return escape_specials(decode_entities(text), specials)
+    return escape_specials(convert_markup(decode_entities(text)), specials)
 
 
 def find_residue(text: str) -> list:
