@@ -56,3 +56,13 @@ def test_generate_filename():
     assert generate_filename("", "") == "Unknown.pdf"
     assert generate_filename("Unknown", "Unknown") == "Unknown.pdf"
     assert generate_filename("Łukasz", "2020").endswith("2020.pdf")
+
+
+def test_generate_filename_folds_diacritics_to_ascii():
+    # Diacritics are transliterated, not dropped: Könemann -> Konemann (not Knemann).
+    assert generate_filename("Könemann, Hans", "1980") == "Konemann1980.pdf"
+    assert generate_filename("Müller", "2021") == "Muller2021.pdf"
+    assert generate_filename("Ångström", "2020") == "Angstrom2020.pdf"
+    assert generate_filename("Gonçalo", "2018") == "Goncalo2018.pdf"
+    assert generate_filename("Børseth", "2001") == "Borseth2001.pdf"   # ø has no NFKD form
+    assert generate_filename("Łukasz", "2020") == "Lukasz2020.pdf"     # ł has no NFKD form

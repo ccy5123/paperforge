@@ -4,6 +4,7 @@ from __future__ import annotations
 import itertools
 import re
 import string
+import unicodedata
 
 # A permissive DOI matcher (Crossref-style). Case-insensitive.
 DOI_RE = re.compile(r"10\.\d{4,9}/[-._;()/:A-Za-z0-9]+", re.IGNORECASE)
@@ -19,6 +20,28 @@ _DOI_PREFIXES = (
 _DOI_TRAILING = ".,;)]}>\"' \t\r\n"
 
 _NON_ALNUM = re.compile(r"[^A-Za-z0-9]+")
+
+# Latin letters that carry no NFKD decomposition (a stroke/ligature, not a base
+# letter + combining mark), so the fold below can't recover their ASCII base.
+_TRANSLIT = str.maketrans({
+    "ø": "o", "Ø": "O", "ł": "l", "Ł": "L", "đ": "d", "Đ": "D",
+    "ð": "d", "Ð": "D", "þ": "th", "Þ": "Th", "ß": "ss",
+    "æ": "ae", "Æ": "AE", "œ": "oe", "Œ": "OE", "ı": "i",
+})
+
+
+def _ascii_fold(value: str) -> str:
+    """Transliterate accented Latin to ASCII so keys/filenames keep the letter.
+
+    ``Könemann`` -> ``Konemann`` (not ``Knemann``). Decomposable diacritics
+    (ö, é, å, ç, ñ, …) drop to their base letter via NFKD; the handful of
+    non-decomposing letters (ø, ł, …) are mapped explicitly. Anything still
+    non-ASCII is left for :data:`_NON_ALNUM` to strip.
+    """
+    if not value:
+        return ""
+    decomposed = unicodedata.normalize("NFKD", value.translate(_TRANSLIT))
+    return "".join(c for c in decomposed if not unicodedata.combining(c))
 # Plausible publication years (1500-2199); guards against grabbing random digits.
 _YEAR_RE = re.compile(r"\b(1[5-9]\d{2}|2[01]\d{2})\b")
 
@@ -67,7 +90,7 @@ def clean_year(year) -> str:
 
 
 def _slug(value: str, maxlen: int = 40) -> str:
-    return _NON_ALNUM.sub("", value or "")[:maxlen]
+    return _NON_ALNUM.sub("", _ascii_fold(value))[:maxlen]
 
 
 def _blank_if_unknown(value: str) -> str:

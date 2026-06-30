@@ -108,7 +108,7 @@ def test_non_ascii_roundtrips_without_corruption():
     coll = BibCollection()
     raw = "@article{x, title={Café Möld}, author={Müller, Ångström}, year={2021}}"
     e = coll.add("10.1000/u", raw)
-    assert e.key == "Mller2021"            # key is ASCII-slugged (matches PDF name)
+    assert e.key == "Muller2021"           # diacritics folded to ASCII (matches PDF name)
     assert "Café Möld" in e.text           # body preserved verbatim
     assert "Müller" in e.text
 
