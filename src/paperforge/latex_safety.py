@@ -22,12 +22,14 @@ Design (kept deliberately small so nobody "improves" it into casework):
   makes the fix *complete* rather than enumerative: anything the escape set
   missed is surfaced loudly instead of leaking silently.
 
-Pure, string-in/string-out, no I/O. Only ``html`` and ``re`` (stdlib) are used.
+Pure, string-in/string-out, no I/O. Only ``html``, ``re`` and ``unicodedata``
+(stdlib) are used.
 """
 from __future__ import annotations
 
 import html
 import re
+import unicodedata
 
 # The only special that leaks bare from registrar BibTeX in practice. A bare
 # ``&`` is a tabular alignment-tab character -> "Misplaced alignment tab" at
@@ -68,6 +70,11 @@ _ENTITY_RE = re.compile(r"&[A-Za-z][A-Za-z0-9]*;|&#\d+;|&#x[0-9A-Fa-f]+;")
 _BARE_AMP_RE = re.compile(r"(?<!\\)&")
 
 
+# Zero-width characters (category Cf, not Zs) that registrar metadata sometimes
+# carries; they have no width and no place in a cite, so they are dropped.
+_ZERO_WIDTH = ("\u200b", "\u200c", "\u200d")  # ZWSP, ZWNJ, ZWJ
+
+
 class SeamLeak(Exception):
     """Raised when :func:`assert_seam_closed` finds un-transcoded residue."""
 
@@ -79,6 +86,30 @@ def decode_entities(text: str) -> str:
     per-entity casework (I3). Text with no entities is returned unchanged.
     """
     return html.unescape(text)
+
+
+def normalize_spaces(text: str) -> str:
+    """Fold non-standard Unicode spaces to ASCII space; drop zero-width chars.
+
+    Crossref encodes given names with typographic spaces (e.g. ``Jon A.`` uses
+    U+2005 FOUR-PER-EM SPACE), and ``inputenc(utf8)`` has no definition for them,
+    so each errors at ``pdflatex`` time. Every Space-Separator (category ``Zs``)
+    other than the ASCII space becomes one ASCII space; zero-width characters are
+    removed. Idempotent (ASCII space is itself ``Zs`` but is left as-is) and pure.
+
+    Deliberately category-driven, not a hand list, so future exotic spaces are
+    covered. Dashes (U+2013/U+2014, category ``Pd``) and accented letters are
+    **not** ``Zs`` and are left untouched.
+    """
+    out = []
+    for ch in text:
+        if ch in _ZERO_WIDTH:
+            continue
+        if ch != " " and unicodedata.category(ch) == "Zs":
+            out.append(" ")
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 def escape_specials(text: str, specials=DEFAULT_SPECIALS) -> str:
@@ -118,14 +149,16 @@ def convert_markup(text: str, _max_passes: int = 6) -> str:
 def sanitize(text: str, specials=DEFAULT_SPECIALS) -> str:
     """Decode the source convention, then encode the target convention -- once.
 
-    ``sanitize == escape_specials ∘ convert_markup ∘ decode_entities``. Decoding
-    first means entity-encoded markup (``&lt;i&gt;``) is converted too. Idempotent
+    ``sanitize == escape_specials ∘ convert_markup ∘ normalize_spaces ∘
+    decode_entities``. Decoding first means entity-encoded markup (``&lt;i&gt;``)
+    and entity-encoded spaces (``&nbsp;`` -> U+00A0) are handled too. Idempotent
     (I1), field-value-only (I2), minimal on the seam classes (I7), and (by
     construction + :func:`find_residue`) entity/ampersand seam-closing (I6).
-    Markup conversion is best-effort (well-formed pairs only); it is not part of
-    the hard residue postcondition.
+    Markup conversion and space normalization are best-effort; they are not part
+    of the hard residue postcondition.
     """
-    return escape_specials(convert_markup(decode_entities(text)), specials)
+    return escape_specials(
+        convert_markup(normalize_spaces(decode_entities(text))), specials)
 
 
 def find_residue(text: str) -> list:

@@ -148,6 +148,18 @@ def test_add_structural_identity_field_value_only():
     assert [f.key for f in stored.fields] == ["title", "author", "year", "journal"]
 
 
+def test_add_normalizes_nonstandard_unicode_space_in_author():
+    # Crossref encodes "Jon A." with U+2005 (FOUR-PER-EM SPACE); inputenc(utf8)
+    # errors on it. The stored entry must carry a plain ASCII space instead.
+    import unicodedata
+    coll = BibCollection()
+    raw = "@article{x, author={Arnot, Jon A.}, year={2003}, title={T}}"
+    e = coll.add("10.1002/qsar", raw)
+    assert "Arnot, Jon A." in e.text
+    leftover = [c for c in e.text if c != " " and unicodedata.category(c) == "Zs"]
+    assert leftover == []
+
+
 def test_add_decimal_and_hex_entities_decode_at_seam():
     coll = BibCollection()
     raw = "@article{x, title={Don&#39;t &#x2019;quote&#x2019;}, author={A, B}, year={2020}}"
