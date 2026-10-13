@@ -157,6 +157,58 @@ Only on `download` and `all` (they govern the PDF phase):
 | `--overwrite` | re-download DOIs already recorded as success |
 | `--no-metadata` | skip the OpenAlex/Crossref lookup used to name files |
 
+## Supporting Information → one zip (`tools/si_harvest.py`)
+
+A standalone script, independent of the `paperforge` package, that finds the
+**Supporting Information** of every DOI, downloads it, and bundles it all into
+one flat zip with a manifest:
+
+```bash
+python tools/si_harvest.py dois.txt --email you@example.org -o si_out
+```
+
+```
+si_out/
+  files/Smith2012_SI1.pdf, Smith2012_SI2.xlsx, Konemann2018_SI1.pdf, ...
+  si_manifest.csv     # doi, stem, status, file, source, original_name, url, bytes, sha256, note
+  SI.zip              # the files, flat, plus si_manifest.csv
+```
+
+Inputs are the same kinds as above (`.txt`, `.csv`/`.tsv`, `.xlsx`, bare
+DOIs). Files are named `<Surname><Year>_SI<n>.<ext>`, with `a`/`b`/… on
+collisions. Runs resume: a DOI already harvested is skipped next time, and
+blocked, failed or empty DOIs are retried.
+
+For each DOI it works through these routes, cheapest first:
+
+1. **APIs and open mirrors**: ChemRxiv API, figshare (ACS, T&F, SAGE and
+   PLOS mirror their SI there), the Europe PMC supplementary bundle, the
+   Elsevier Object API (`--elsevier-key`), and Zenodo/figshare deposits that
+   DataCite or Crossref record as supplementing the article.
+2. **Publisher pages**: the landing page plus known SI pages (Atypon
+   `/doi/suppl/`, Wiley `/doi/full/`, ScienceDirect, bioRxiv, PMC), scanned
+   for SI links (ACS, Wiley, Springer Nature, Elsevier, PLOS, RSC, MDPI,
+   Frontiers, OUP, …).
+3. **URL probing**, when nothing complete has turned up yet: Elsevier
+   `ars.els-cdn.com/…-mmcN`, RSC `suppdata`, PLOS `.s00N`.
+4. **A real browser**, for pages behind Cloudflare and similar walls. Needs
+   `pip install playwright && playwright install chromium`. With `--browser
+   show` you get a visible window, so you can pass a check or log in through
+   your institution once. The profile (`--browser-profile`) keeps those
+   cookies for later runs.
+
+Downloads that come back as HTML (a login wall or bot check) are never saved
+as SI, and a file reached by two routes is kept only once.
+
+| Flag | Meaning |
+| --- | --- |
+| `--browser auto\|show\|off` | real-browser fallback (default `auto`: headless, only when needed) |
+| `--cookies FILE` | Netscape `cookies.txt` exported from a logged-in browser |
+| `--elsevier-key KEY` | Elsevier API key (or `$ELSEVIER_API_KEY`) |
+| `--delay SEC` | min gap between requests to one publisher host (default 1.0) |
+| `--max-mb N` | skip files larger than N MB (default 200) |
+| `--no-probe` / `--overwrite` / `--zip NAME` | no URL guessing / re-harvest everything / zip file name |
+
 ## Library use
 
 ```python

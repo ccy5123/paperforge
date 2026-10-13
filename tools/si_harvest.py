@@ -1,0 +1,1462 @@
+#!/usr/bin/env python3
+"""si_harvest - gather the Supporting Information (SI) of a DOI list into one zip.
+
+Standalone script, independent of the paperforge package. It needs only
+``requests``; ``openpyxl`` adds .xlsx input and ``playwright`` adds the
+real-browser fallback for publisher pages that refuse plain HTTP clients.
+
+    python tools/si_harvest.py dois.txt --email you@example.org -o si_out
+
+    si_out/
+      files/Smith2020_SI1.pdf, Smith2020_SI2.xlsx, Lee2019a_SI1.docx, ...
+      si_manifest.csv     # one row per SI file (and one per DOI without SI)
+      SI.zip              # the files above, flat, plus si_manifest.csv
+
+Discovery, per DOI, cheap and reliable routes first:
+
+  1. APIs and open mirrors: the ChemRxiv API, figshare (ACS, T&F, SAGE and PLOS
+     mirror their SI there), Europe PMC's supplementary-files bundle, the
+     Elsevier Object API (with an API key), and deposits that DataCite or
+     Crossref record as supplementing the article (Zenodo / figshare).
+  2. Publisher pages over plain HTTP: the DOI landing page plus the known SI
+     pages (Atypon ``/doi/suppl/``, Wiley ``/doi/full/``, ScienceDirect,
+     bioRxiv ``.supplementary-material``, PMC), scanned for SI links.
+  3. URL probing, if nothing complete yet: predictable SI locations
+     (Elsevier ``ars.els-cdn.com/...-mmcN``, RSC ``suppdata``, PLOS ``.s00N``).
+  4. A real browser, if still nothing: blocked pages (Cloudflare and co.) are
+     reopened in Chromium via Playwright and the SI is fetched inside that
+     browser session. ``--browser show`` opens a visible window so a human can
+     pass a challenge or log in once; the profile keeps those cookies.
+
+Every download is checked: an HTML page (a login wall or bot challenge) is
+never saved as SI, and the same file reached by two routes is kept once.
+Runs are resumable: DOIs already harvested are skipped on the next run.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import csv
+import hashlib
+import http.cookiejar
+import io
+import itertools
+import json
+import logging
+import mimetypes
+import os
+import random
+import re
+import string
+import sys
+import time
+import unicodedata
+import zipfile
+from dataclasses import dataclass, field
+from html.parser import HTMLParser
+from pathlib import Path
+from typing import Any, Iterable, Optional
+from urllib.parse import parse_qs, quote, unquote, urldefrag, urljoin, urlparse
+
+import requests
+from requests.adapters import HTTPAdapter
+from requests.structures import CaseInsensitiveDict
+from urllib3.util.retry import Retry
+
+__version__ = "1.0"
+
+log = logging.getLogger("si_harvest")
+
+BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
+
+_BROWSER_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+              "image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+}
+
+# Metadata APIs and CDNs tolerate a much tighter request pace than publisher pages.
+_FAST_HOSTS = {
+    "api.crossref.org", "api.openalex.org", "api.datacite.org", "api.figshare.com",
+    "ndownloader.figshare.com", "zenodo.org", "www.ebi.ac.uk", "doi.org",
+    "api.elsevier.com", "ars.els-cdn.com", "static-content.springer.com",
+}
+
+BLOCK_STATUSES = {401, 403, 429, 503}
+
+# Bot walls (Cloudflare, Akamai, Imperva, PerimeterX, DataDome). Only checked on
+# small pages: real article pages are far larger, and Cloudflare injects its
+# challenge-platform script into ordinary pages too.
+_BLOCK_MARKERS = (
+    "cf-browser-verification", "cf_chl_", "challenge-platform", "just a moment",
+    "checking your browser", "verify you are human", "attention required",
+    "px-captcha", "_incapsula_resource", "captcha-delivery", "access denied",
+    "request unsuccessful", "are you a robot", "unusual traffic",
+    "enable javascript and cookies",
+)
+
+DOC_EXTS = {
+    "pdf", "doc", "docx", "xls", "xlsx", "xlsm", "csv", "tsv", "txt", "rtf", "odt",
+    "ods", "ppt", "pptx", "zip", "gz", "tgz", "7z", "rar", "tar", "cif", "mol",
+    "mol2", "sdf", "xyz", "pdb", "mp4", "avi", "mov", "wmv", "mpg", "mp3", "wav",
+    "xml", "json", "r", "py", "m", "mat", "h5", "nc", "fasta", "fa", "gb", "ipynb",
+}
+IMAGE_EXTS = {"png", "jpg", "jpeg", "gif", "tif", "tiff", "bmp", "svg", "eps", "webp"}
+SI_EXTS = DOC_EXTS | IMAGE_EXTS
+_WEB_EXTS = {"html", "htm", "php", "asp", "aspx", "jsp", "do", "cgi", "action", "cfm"}
+
+# URL shapes that are SI by construction, whatever the link text says.
+_SI_URL_RE = re.compile("|".join([
+    r"/suppl_file/",                              # Atypon: ACS, T&F, SAGE, CSP, Science, PNAS
+    r"/action/downloadSupplement\b",              # Wiley Online Library
+    r"/suppdata/",                                # RSC
+    r"static-content\.springer\.com/esm/",        # Springer Nature ESM
+    r"_MOESM\d+_ESM\.",                           # Springer Nature ESM file names
+    r"ars\.els-cdn\.com/content/image/[^?#]*-mmc\d+\.",  # Elsevier multimedia components
+    r"[?&]type=supplementary\b",                  # PLOS
+    r"/DC\d+/embed/media-\d+",                    # HighWire: bioRxiv, medRxiv
+    r"ndownloader\.figshare\.com/files/\d+",
+    r"figshare\.com/ndownloader/files/\d+",
+    r"frontiersin\.org/api/v\d+/articles/\d+/file/",  # Frontiers data sheets
+    r"mdpi\.com/[^?#]+/s\d+(?:[?#]|$)",           # MDPI .../s1
+    r"ncbi\.nlm\.nih\.gov/(?:pmc/)?articles/[^?#]+/bin/",  # PMC
+]), re.IGNORECASE)
+
+_SI_WORDS = re.compile(
+    r"supplement|supporting[\s_-]*info|suppl|(?:^|[^a-z])si(?:[^a-z]|$)|\besm\b|moesm"
+    r"|additional[\s_-]*file|data[\s_-]*sheet|appendix|mmc\d|\.s\d{3}\."
+    r"|\bs\d+[\s_-]*(?:file|table|fig|figure|data|dataset|text|appendix)",
+    re.IGNORECASE,
+)
+
+_EXCLUDE_RE = re.compile(
+    r"^(?:mailto|javascript|tel|data):|/doi/(?:e?pdf|pdfdirect|epdf|reader)/|/pdfft\b"
+    r"|showCitFormats|type=printable|\.(?:ris|bib|enw|nbib)(?:[?#]|$)",
+    re.IGNORECASE,
+)
+
+PLOS_JOURNALS = {
+    "pone": "plosone", "pbio": "plosbiology", "pmed": "plosmedicine",
+    "pcbi": "ploscompbiol", "pgen": "plosgenetics", "ppat": "plospathogens",
+    "pntd": "plosntds", "pclm": "climate", "pwat": "water",
+    "pgph": "globalpublichealth", "pdig": "digitalhealth",
+    "pstr": "sustainabilitytransformation", "pmen": "mentalhealth",
+    "pcsy": "complexsystems",
+}
+_ELSEVIER_PROBE_EXTS = ("pdf", "docx", "xlsx", "doc", "xls", "zip", "csv", "txt", "pptx", "mp4")
+_RSC_PROBE_EXTS = ("pdf", "zip", "xlsx", "docx", "cif", "txt", "xyz", "mp4")
+
+MANIFEST_FIELDS = ["doi", "stem", "status", "file", "source", "original_name",
+                   "url", "bytes", "sha256", "note"]
+
+
+# ============================================================
+# DOIs and names
+# ============================================================
+
+DOI_RE = re.compile(r"10\.\d{4,9}/[-._;()/:<>A-Za-z0-9]+", re.IGNORECASE)
+_DOI_PREFIX_RE = re.compile(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", re.IGNORECASE)
+
+
+def normalize_doi(doi: str) -> str:
+    """Bare DOI: no resolver prefix, no clinging punctuation (balanced parens kept)."""
+    doi = _DOI_PREFIX_RE.sub("", unquote(str(doi or "").strip())).strip()
+    while doi:
+        if doi[-1] in ".,;]}\"' \t\r\n":
+            doi = doi[:-1]
+        elif doi[-1] == ")" and doi.count("(") < doi.count(")"):
+            doi = doi[:-1]
+        elif doi[-1] == ">" and doi.count("<") < doi.count(">"):
+            doi = doi[:-1]
+        else:
+            break
+    return doi
+
+
+def extract_dois(text: str) -> list[str]:
+    out, seen = [], set()
+    for m in DOI_RE.finditer(str(text or "")):
+        doi = normalize_doi(m.group(0))
+        if doi and doi.lower() not in seen:
+            seen.add(doi.lower())
+            out.append(doi)
+    return out
+
+
+def _dois_from_file(path: Path) -> list[str]:
+    if path.suffix.lower() in (".xlsx", ".xlsm"):
+        try:
+            import openpyxl
+        except ImportError:
+            raise SystemExit("Reading .xlsx needs openpyxl: pip install openpyxl")
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        try:
+            cells = (str(v) for ws in wb.worksheets
+                     for row in ws.iter_rows(values_only=True) for v in row if v is not None)
+            return extract_dois("\n".join(cells))
+        finally:
+            wb.close()
+    text = path.read_text(encoding="utf-8-sig", errors="replace")
+    return extract_dois("\n".join(line for line in text.splitlines()
+                                  if not line.lstrip().startswith("#")))
+
+
+def read_dois(inputs: Iterable[str]) -> list[str]:
+    """DOIs from files (.txt/.csv/.tsv/.xlsx) and bare DOI arguments, de-duplicated."""
+    found: list[str] = []
+    for item in inputs:
+        path = Path(item)
+        if path.is_file():
+            found += _dois_from_file(path)
+            continue
+        dois = extract_dois(item)
+        if not dois:
+            log.warning("Ignoring input (not a file or DOI): %s", item)
+        found += dois
+    out, seen = [], set()
+    for doi in found:
+        if doi.lower() not in seen:
+            seen.add(doi.lower())
+            out.append(doi)
+    return out
+
+
+_TRANSLIT = str.maketrans({
+    "ø": "o", "Ø": "O", "ł": "l", "Ł": "L", "đ": "d", "Đ": "D", "ð": "d", "Ð": "D",
+    "þ": "th", "Þ": "Th", "ß": "ss", "æ": "ae", "Æ": "AE", "œ": "oe", "Œ": "OE", "ı": "i",
+})
+
+
+def _slug(value: str, maxlen: int = 40) -> str:
+    folded = unicodedata.normalize("NFKD", (value or "").translate(_TRANSLIT))
+    ascii_ = "".join(c for c in folded if not unicodedata.combining(c))
+    return re.sub(r"[^A-Za-z0-9]+", "", ascii_)[:maxlen]
+
+
+def stem_base(author: str, year: str, doi: str) -> str:
+    """``<Surname><Year>`` (``Konemann2018``); the DOI itself when both are unknown."""
+    base = f"{_slug(author)}{_slug(year)}"
+    return base or re.sub(r"[^A-Za-z0-9]+", "_", doi).strip("_")[:60] or "Unknown"
+
+
+def collision_suffixes():
+    """``a, b, ..., z, aa, ab, ...`` - the same scheme paperforge uses for keys."""
+    for n in itertools.count(1):
+        for combo in itertools.product(string.ascii_lowercase, repeat=n):
+            yield "".join(combo)
+
+
+# ============================================================
+# HTTP
+# ============================================================
+
+def _origin(url: str) -> str:
+    p = urlparse(url)
+    return f"{p.scheme}://{p.netloc}".lower()
+
+
+@dataclass
+class Fetched:
+    url: str
+    status: int
+    headers: Any = field(default_factory=CaseInsensitiveDict)
+    content: bytes = b""
+    error: str = ""
+
+    @property
+    def text(self) -> str:
+        return self.content.decode("utf-8", errors="replace")
+
+    @property
+    def content_type(self) -> str:
+        return (self.headers.get("content-type") or "").split(";")[0].strip().lower()
+
+
+class Http:
+    """requests with two faces: an identified API client, and a browser-like one
+    (Chrome headers, cookies, Referer) for publisher pages. Paced per host."""
+
+    def __init__(self, email: str = "", delay: float = 1.0, user_agent: Optional[str] = None,
+                 cookies_file: Optional[str] = None, max_bytes: int = 200 * 2**20,
+                 session: Optional[requests.Session] = None):
+        self.email = email
+        self.delay = delay
+        self.browser_ua = user_agent or BROWSER_UA
+        self.max_bytes = max_bytes
+        self.session = session if session is not None else self._build_session()
+        self._last: dict[str, float] = {}
+        if cookies_file:
+            jar = http.cookiejar.MozillaCookieJar(str(cookies_file))
+            jar.load(ignore_discard=True, ignore_expires=True)
+            for cookie in jar:
+                self.session.cookies.set_cookie(cookie)
+
+    @staticmethod
+    def _build_session() -> requests.Session:
+        s = requests.Session()
+        # A refused connection (DNS, proxy, firewall, TLS) rarely heals in seconds:
+        # retry it once; transient server answers get the full backoff.
+        retry = Retry(total=3, connect=1, other=1, read=2, backoff_factor=1.5,
+                      status_forcelist=[429, 500, 502, 504],
+                      allowed_methods={"GET", "POST"}, raise_on_status=False,
+                      respect_retry_after_header=False)
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        return s
+
+    @property
+    def api_ua(self) -> str:
+        contact = f"; mailto:{self.email}" if self.email else ""
+        return f"si_harvest/{__version__} (+https://github.com/ccy5123/paperforge{contact})"
+
+    def close(self) -> None:
+        self.session.close()
+
+    def adopt_browser(self, cookies: list[dict], user_agent: Optional[str]) -> None:
+        """Reuse a browser's clearance: its cookies and (they are bound to it) its UA."""
+        for c in cookies:
+            self.session.cookies.set(c["name"], c["value"],
+                                     domain=c.get("domain", ""), path=c.get("path", "/"))
+        if user_agent:
+            self.browser_ua = user_agent
+
+    def _throttle(self, url: str) -> None:
+        host = (urlparse(url).hostname or "").lower()
+        gap = min(self.delay, 0.2) if host in _FAST_HOSTS else self.delay
+        if gap <= 0:
+            return
+        last = self._last.get(host)
+        if last is not None:
+            wait = gap + random.uniform(0, gap / 2) - (time.monotonic() - last)
+            if wait > 0:
+                time.sleep(wait)
+        self._last[host] = time.monotonic()
+
+    def _headers(self, url: str, api: bool, referer: Optional[str],
+                 accept: Optional[str], extra: Optional[dict]) -> dict:
+        if api:
+            h = {"User-Agent": self.api_ua, "Accept": accept or "application/json"}
+        else:
+            h = dict(_BROWSER_HEADERS, **{"User-Agent": self.browser_ua})
+            if accept:
+                h["Accept"] = accept
+            if referer:
+                h["Referer"] = referer
+                h["Sec-Fetch-Site"] = ("same-origin" if _origin(referer) == _origin(url)
+                                       else "cross-site")
+        h.update(extra or {})
+        return h
+
+    def request(self, url: str, *, api: bool = False, referer: Optional[str] = None,
+                accept: Optional[str] = None, params: Optional[dict] = None,
+                json_body: Any = None, headers: Optional[dict] = None,
+                timeout=(10, 30)) -> Fetched:
+        """GET (or POST with ``json_body``), body capped at ``max_bytes``. Never raises."""
+        self._throttle(url)
+        hdrs = self._headers(url, api, referer, accept, headers)
+        try:
+            if json_body is not None:
+                r = self.session.post(url, json=json_body, params=params, headers=hdrs,
+                                      timeout=timeout, stream=True)
+            else:
+                r = self.session.get(url, params=params, headers=hdrs, timeout=timeout,
+                                     stream=True, allow_redirects=True)
+        except requests.RequestException as e:
+            return Fetched(url=url, status=0, error=_short_error(e))
+        try:
+            if int(r.headers.get("content-length") or 0) > self.max_bytes:
+                return Fetched(url=r.url, status=r.status_code, headers=r.headers,
+                               error="too large")
+            buf = bytearray()
+            for chunk in r.iter_content(65536):
+                buf += chunk
+                if len(buf) > self.max_bytes:
+                    return Fetched(url=r.url, status=r.status_code, headers=r.headers,
+                                   error="too large")
+            return Fetched(url=r.url, status=r.status_code, headers=r.headers,
+                           content=bytes(buf))
+        except (requests.RequestException, ValueError) as e:
+            return Fetched(url=url, status=0, error=_short_error(e))
+        finally:
+            r.close()
+
+    def get_json(self, url: str, **kw) -> Any:
+        f = self.request(url, api=True, **kw)
+        if f.status != 200:
+            return None
+        try:
+            return json.loads(f.content)
+        except ValueError:
+            return None
+
+    def probe(self, url: str) -> bool:
+        """Is there a (non-HTML) file at ``url``? Reads the headers only."""
+        self._throttle(url)
+        try:
+            r = self.session.get(url, headers=self._headers(url, False, None, "*/*", None),
+                                 timeout=(10, 20), stream=True, allow_redirects=True)
+        except requests.RequestException:
+            return False
+        try:
+            return r.status_code == 200 and "text/html" not in (
+                r.headers.get("content-type") or "").lower()
+        finally:
+            r.close()
+
+
+def _short_error(e: Exception) -> str:
+    """``ProxyError (Tunnel connection failed: 403 Forbidden)`` rather than a pool dump."""
+    reason = str(e)
+    m = re.findall(r"\(([^()]*)\)\)*$", reason) or re.findall(r"'([^']{4,})'\)*$", reason)
+    return f"{type(e).__name__} ({(m[-1] if m else reason)[:120]})"
+
+
+def looks_blocked(status: int, text: str) -> bool:
+    """A bot wall / challenge rather than the page we asked for?"""
+    if status in BLOCK_STATUSES:
+        return True
+    if status != 200 or not text or len(text) > 60000:
+        return False
+    low = text.lower()
+    return any(m in low for m in _BLOCK_MARKERS)
+
+
+def _looks_html(content: bytes, content_type: str) -> bool:
+    if content_type in ("text/html", "application/xhtml+xml"):
+        return True
+    head = content[:1024].lstrip().lower()
+    return head.startswith((b"<!doctype html", b"<html")) or b"<html" in head[:200]
+
+
+def reject_reason(f: Fetched) -> str:
+    """Why a download is not an SI file ('' when it is one)."""
+    if f.error:
+        return f.error
+    if f.status in BLOCK_STATUSES:
+        return "blocked"
+    if f.status != 200:
+        return f"HTTP {f.status}"
+    if not f.content:
+        return "empty"
+    if _looks_html(f.content, f.content_type):
+        return "blocked" if looks_blocked(200, f.text) else "html"
+    return ""
+
+
+# ============================================================
+# Pages and links
+# ============================================================
+
+@dataclass
+class PageLinks:
+    url: str
+    anchors: list[tuple[str, str]]      # (absolute href, visible label)
+    pdf_urls: set[str] = field(default_factory=set)   # citation_pdf_url: the paper itself
+    blocked: bool = False
+
+
+class _LinkParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.anchors: list[tuple[str, str]] = []
+        self.pdf_urls: list[str] = []
+        self.base: Optional[str] = None
+        self._open: list[list] = []
+
+    def handle_starttag(self, tag, attrs):
+        a = {k: (v or "") for k, v in attrs}
+        if tag == "a" and a.get("href"):
+            extra = " ".join(filter(None, (a.get("title"), a.get("aria-label"), a.get("download"))))
+            self._open.append([a["href"], [extra]])
+        elif tag == "base" and a.get("href") and self.base is None:
+            self.base = a["href"]
+        elif tag == "meta" and (a.get("name") or "").lower() == "citation_pdf_url":
+            self.pdf_urls.append(a.get("content", ""))
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._open:
+            self._flush(self._open.pop())
+
+    def handle_data(self, data):
+        for item in self._open:
+            item[1].append(data)
+
+    def _flush(self, item):
+        self.anchors.append((item[0], " ".join(" ".join(item[1]).split())))
+
+    def close(self):
+        super().close()
+        while self._open:
+            self._flush(self._open.pop())
+
+
+def parse_page(html: str, base_url: str) -> PageLinks:
+    p = _LinkParser()
+    try:
+        p.feed(html)
+        p.close()
+    except Exception as e:  # malformed markup: keep whatever was parsed
+        log.debug("HTML parse error on %s: %s", base_url, e)
+    base = urljoin(base_url, p.base) if p.base else base_url
+    anchors = [(urldefrag(urljoin(base, href.strip()))[0], label) for href, label in p.anchors]
+    pdfs = {urljoin(base, u) for u in p.pdf_urls if u}
+    return PageLinks(url=base_url, anchors=anchors, pdf_urls=pdfs)
+
+
+def _url_ext(url: str) -> str:
+    """The file extension a URL points at, from its path or a ``file=`` parameter."""
+    p = urlparse(url)
+    names = [unquote(p.path.rsplit("/", 1)[-1])]
+    q = parse_qs(p.query)
+    for key in ("file", "filename", "name"):
+        names += [v.rsplit("/", 1)[-1] for v in q.get(key, [])]
+    for name in names:
+        if "." in name:
+            ext = name.rsplit(".", 1)[-1].lower()
+            if ext in SI_EXTS:
+                return ext
+    return ""
+
+
+def is_si_link(url: str, label: str = "") -> bool:
+    if not url.lower().startswith(("http://", "https://")) or _EXCLUDE_RE.search(url):
+        return False
+    explicit = bool(_SI_URL_RE.search(url))
+    worded = bool(_SI_WORDS.search(unquote(url)) or _SI_WORDS.search(label or ""))
+    ext = _url_ext(url)
+    if ext in IMAGE_EXTS:  # figures are links too; take images only when plainly SI
+        return explicit and worded
+    return explicit or (bool(ext) and worded)
+
+
+def si_links(page: PageLinks) -> list[str]:
+    out, seen = [], set()
+    for url, label in page.anchors:
+        if url in page.pdf_urls or url in seen:
+            continue
+        if is_si_link(url, label):
+            seen.add(url)
+            out.append(url)
+    return out
+
+
+# ============================================================
+# File naming
+# ============================================================
+
+def _cd_filename(cd: str) -> str:
+    if not cd:
+        return ""
+    m = re.search(r"filename\*\s*=\s*(?:[\w-]+'[^']*')?([^;]+)", cd, re.IGNORECASE)
+    if m:
+        return unquote(m.group(1).strip().strip('"'))
+    m = re.search(r'filename\s*=\s*"?([^";]+)"?', cd, re.IGNORECASE)
+    return m.group(1).strip() if m else ""
+
+
+def _name_from_url(url: str) -> str:
+    p = urlparse(url)
+    q = parse_qs(p.query)
+    for key in ("file", "filename", "id"):
+        if q.get(key):
+            return q[key][0].rsplit("/", 1)[-1]
+    return unquote(p.path.rstrip("/").rsplit("/", 1)[-1])
+
+
+def _ext_of(name: str) -> str:
+    name = (name or "").strip().rsplit("/", 1)[-1]
+    if "." not in name:
+        return ""
+    ext = name.rsplit(".", 1)[-1].lower()
+    return ext if re.fullmatch(r"[a-z0-9]{1,6}", ext) and ext not in _WEB_EXTS else ""
+
+
+def _sniff_ext(content: bytes, content_type: str) -> str:
+    if content.startswith(b"%PDF-"):
+        return ".pdf"
+    if content.startswith(b"PK\x03\x04"):
+        try:
+            names = zipfile.ZipFile(io.BytesIO(content)).namelist()
+        except zipfile.BadZipFile:
+            return ".zip"
+        for prefix, ext in (("word/", ".docx"), ("xl/", ".xlsx"), ("ppt/", ".pptx")):
+            if any(n.startswith(prefix) for n in names):
+                return ext
+        return ".zip"
+    if content.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):  # legacy Office
+        return ".xls" if "excel" in content_type else ".ppt" if "powerpoint" in content_type else ".doc"
+    for magic, ext in ((b"\x1f\x8b", ".gz"), (b"\x89PNG", ".png"), (b"\xff\xd8\xff", ".jpg"),
+                       (b"GIF8", ".gif"), (b"II*\x00", ".tif"), (b"MM\x00*", ".tif"),
+                       (b"{\\rtf", ".rtf"), (b"7z\xbc\xaf\x27\x1c", ".7z"), (b"Rar!", ".rar")):
+        if content.startswith(magic):
+            return ext
+    if content[4:8] == b"ftyp":
+        return ".mp4"
+    guess = mimetypes.guess_extension(content_type) if content_type else None
+    if guess and guess not in (".html", ".htm", ".bin", ".a", ".exe"):
+        return guess
+    return ".txt" if b"\x00" not in content[:4096] else ".bin"
+
+
+def detect_ext(content: bytes, *, names: Iterable[str] = (), url: str = "",
+               content_type: str = "") -> str:
+    """Extension for a saved SI file: a name the server/source gave, else the URL,
+    else the bytes themselves."""
+    for name in names:
+        ext = _ext_of(name)
+        if ext:
+            return "." + ext
+    ext = _url_ext(url)
+    return "." + ext if ext else _sniff_ext(content, content_type)
+
+
+# ============================================================
+# Browser fallback (Playwright)
+# ============================================================
+
+class BrowserSession:
+    """A real Chromium for pages that refuse plain HTTP clients.
+
+    Uses a persistent profile, so a challenge passed (or an institutional login
+    done) in ``--browser show`` mode is remembered across runs.
+    """
+
+    _ANCHORS_JS = r"""els => els.map(e => [e.href,
+        [e.innerText || e.textContent || '', e.getAttribute('title') || '',
+         e.getAttribute('aria-label') || ''].join(' ').replace(/\s+/g, ' ').trim()])"""
+
+    # Same-origin fetch inside the page: rides the page's cookies, TLS and headers.
+    _FETCH_JS = r"""async ([u, maxBytes]) => {
+        const r = await fetch(u, {credentials: 'include'});
+        const len = parseInt(r.headers.get('content-length') || '0', 10);
+        if (len && len > maxBytes) return {status: -1, url: r.url};
+        const b = new Uint8Array(await r.arrayBuffer());
+        if (b.length > maxBytes) return {status: -1, url: r.url};
+        let s = '';
+        for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000));
+        return {status: r.status, url: r.url, ct: r.headers.get('content-type') || '',
+                cd: r.headers.get('content-disposition') || '', b64: btoa(s)};
+    }"""
+
+    def __init__(self, profile_dir: Path, show: bool = False):
+        self.profile_dir = Path(profile_dir)
+        self.show = show
+        self.user_agent: Optional[str] = None
+        self._pw = None
+        self._ctx = None
+        self._pages: dict[str, Any] = {}
+
+    @staticmethod
+    def installed() -> bool:
+        try:
+            import playwright.sync_api  # noqa: F401
+        except ImportError:
+            return False
+        return True
+
+    def start(self) -> None:
+        from playwright.sync_api import sync_playwright
+        self.profile_dir.mkdir(parents=True, exist_ok=True)
+        self._pw = sync_playwright().start()
+        try:
+            self._ctx = self._launch(None)
+            ua = self._first_page().evaluate("navigator.userAgent")
+            if "HeadlessChrome" in ua:  # an easy tell; present as the Chrome it is
+                ua = ua.replace("HeadlessChrome", "Chrome")
+                self._ctx.close()
+                self._ctx = self._launch(ua)
+            self.user_agent = ua
+        except Exception:
+            self.close()
+            raise
+
+    def _launch(self, user_agent: Optional[str]):
+        kw: dict = dict(headless=not self.show, accept_downloads=True, locale="en-US",
+                        args=["--disable-blink-features=AutomationControlled"])
+        if user_agent:
+            kw["user_agent"] = user_agent
+        if os.environ.get("SI_CHROMIUM"):
+            kw["executable_path"] = os.environ["SI_CHROMIUM"]
+        return self._pw.chromium.launch_persistent_context(str(self.profile_dir), **kw)
+
+    def _first_page(self):
+        return self._ctx.pages[0] if self._ctx.pages else self._ctx.new_page()
+
+    def _page_for(self, url: str):
+        origin = _origin(url)
+        if origin not in self._pages:
+            free = [p for p in self._ctx.pages if p not in self._pages.values()]
+            self._pages[origin] = free[0] if free else self._ctx.new_page()
+        return self._pages[origin]
+
+    def cookies(self) -> list[dict]:
+        return self._ctx.cookies() if self._ctx else []
+
+    def open(self, url: str) -> Optional[PageLinks]:
+        page = self._page_for(url)
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+        except Exception as e:
+            log.debug("  browser: could not open %s: %s", url, e)
+            return None
+        deadline = time.monotonic() + (180 if self.show else 25)
+        blocked, warned = True, False
+        while True:
+            try:  # the first response's status is stale once a challenge reloads
+                blocked = looks_blocked(200, page.content())
+            except Exception:
+                blocked = True  # mid-navigation
+            if not blocked or time.monotonic() >= deadline:
+                break
+            if self.show and not warned:
+                log.warning("  browser: pass the check in the open window: %s", url)
+                warned = True
+            page.wait_for_timeout(1500)
+        try:
+            page.wait_for_load_state("networkidle", timeout=8_000)
+        except Exception:
+            pass
+        try:
+            anchors = page.eval_on_selector_all("a[href]", self._ANCHORS_JS)
+            pdfs = page.eval_on_selector_all('meta[name="citation_pdf_url"]',
+                                             "els => els.map(e => e.content)")
+            final = page.url
+        except Exception:
+            anchors, pdfs, final = [], [], url
+        # After a redirect (doi.org -> publisher) the page serves the new origin's fetches.
+        self._pages.setdefault(_origin(final), page)
+        return PageLinks(url=final, anchors=[(urldefrag(a)[0], label) for a, label in anchors],
+                         pdf_urls=set(pdfs), blocked=blocked)
+
+    def fetch(self, url: str, referer: Optional[str], max_bytes: int) -> Fetched:
+        origin = _origin(url)
+        if origin not in self._pages and referer and _origin(referer) == origin:
+            self.open(referer)
+        page = self._pages.get(origin)
+        if page is not None:
+            try:
+                r = page.evaluate(self._FETCH_JS, [url, max_bytes])
+                if r.get("status") == -1:
+                    return Fetched(url=url, status=200, error="too large")
+                if r.get("status") == 200:
+                    return Fetched(url=r.get("url") or url, status=200,
+                                   headers=CaseInsensitiveDict({"content-type": r.get("ct", ""),
+                                                                "content-disposition": r.get("cd", "")}),
+                                   content=base64.b64decode(r.get("b64", "")))
+            except Exception as e:
+                log.debug("  browser: in-page fetch failed for %s: %s", url, e)
+        try:
+            resp = self._ctx.request.get(url, headers={"Referer": referer} if referer else None,
+                                         timeout=120_000)
+            return Fetched(url=resp.url, status=resp.status,
+                           headers=CaseInsensitiveDict(resp.headers), content=resp.body())
+        except Exception as e:
+            return Fetched(url=url, status=0, error=f"browser: {e}")
+
+    def close(self) -> None:
+        for closer in (getattr(self._ctx, "close", None), getattr(self._pw, "stop", None)):
+            if closer:
+                try:
+                    closer()
+                except Exception:
+                    pass
+        self._ctx = self._pw = None
+        self._pages = {}
+
+
+# ============================================================
+# Harvesting
+# ============================================================
+
+@dataclass
+class Meta:
+    author: str = ""
+    year: str = ""
+    pii: str = ""                        # Elsevier
+    supplement_dois: list[str] = field(default_factory=list)   # Crossref is-supplemented-by
+
+
+@dataclass
+class Candidate:
+    url: str
+    source: str
+    name: str = ""                       # file name, when the source states one
+    referer: Optional[str] = None
+    complete: bool = True                # source carries the article's whole SI set
+
+
+@dataclass
+class Blob:                              # a file already in hand (unpacked from a bundle)
+    content: bytes
+    source: str
+    name: str
+    url: str
+    complete: bool = True
+
+
+@dataclass
+class SIFile:
+    filename: str
+    source: str
+    original_name: str
+    url: str
+    size: int
+    sha256: str
+
+
+@dataclass
+class Job:
+    doi: str
+    stem: str
+    files: list[SIFile] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    hashes: set[str] = field(default_factory=set)
+    done_urls: set[str] = field(default_factory=set)
+    blocked_pages: list[str] = field(default_factory=list)
+    thin_pages: list[str] = field(default_factory=list)
+    blocked_files: list[Candidate] = field(default_factory=list)
+    pmcid: str = ""
+    complete: bool = False
+    blocked: bool = False
+    failed: bool = False                 # the publisher was unreachable (network error)
+
+    def note(self, message: str) -> None:
+        if message not in self.notes:
+            self.notes.append(message)
+
+    @property
+    def status(self) -> str:
+        if self.files:
+            return "ok"
+        return "blocked" if self.blocked else "error" if self.failed else "none"
+
+    def rows(self) -> list[dict]:
+        note = "; ".join(self.notes)[:1000]
+        if not self.files:
+            return [{"doi": self.doi, "stem": self.stem, "status": self.status, "note": note}]
+        return [{"doi": self.doi, "stem": self.stem, "status": "ok", "file": f.filename,
+                 "source": f.source, "original_name": f.original_name, "url": f.url,
+                 "bytes": f.size, "sha256": f.sha256, "note": note if i == 0 else ""}
+                for i, f in enumerate(self.files)]
+
+
+def _lucene_escape(value: str) -> str:
+    return re.sub(r'([+\-=&|><!(){}\[\]^"~*?:\\/ ])', r"\\\1", value)
+
+
+def _norm_pii(value: str) -> str:
+    pii = re.sub(r"[^A-Za-z0-9]", "", value or "").upper()
+    return pii if re.fullmatch(r"S?\d{7}[\dX]\d{7}[\dX]", pii) else ""
+
+
+def _unzip_blobs(content: bytes, source: str, url: str, max_bytes: int) -> list[Blob]:
+    out = []
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(content))
+    except zipfile.BadZipFile:
+        return out
+    for info in zf.infolist():
+        name = info.filename.rsplit("/", 1)[-1]
+        if (info.is_dir() or not name or info.filename.startswith("__MACOSX/")
+                or name.startswith(".") or info.file_size > max_bytes):
+            continue
+        out.append(Blob(zf.read(info), source, name, f"{url}#{name}"))
+    return out
+
+
+class Harvester:
+    def __init__(self, http: Http, out_dir, *, browser: str = "auto",
+                 browser_profile=None, elsevier_key: Optional[str] = None,
+                 probe: bool = True, overwrite: bool = False, zip_name: str = "SI.zip"):
+        self.http = http
+        self.out_dir = Path(out_dir)
+        self.files_dir = self.out_dir / "files"
+        self.manifest_path = self.out_dir / "si_manifest.csv"
+        self.zip_path = self.out_dir / zip_name
+        self.browser_mode = browser
+        self.browser_profile = Path(browser_profile) if browser_profile else (
+            Path.home() / ".cache" / "si_harvest" / "browser-profile")
+        self.elsevier_key = elsevier_key
+        self.probe = probe
+        self.overwrite = overwrite
+        self._browser: Optional[BrowserSession] = None
+        self._stems: dict[str, str] = {}     # stem -> doi (lowercase) that owns it
+
+    # ---- run ---------------------------------------------------------
+
+    def run(self, dois: list[str]) -> "Summary":
+        self.files_dir.mkdir(parents=True, exist_ok=True)
+        manifest = self._load_manifest()
+        for rows in manifest.values():
+            if rows and rows[0].get("stem"):
+                self._stems.setdefault(rows[0]["stem"], rows[0]["doi"].lower())
+
+        for i, doi in enumerate(dois, start=1):
+            key = doi.lower()
+            old = manifest.get(key)
+            if old and not self.overwrite and self._is_done(old):
+                log.info("[%d/%d] %s -> already harvested (%d files)",
+                         i, len(dois), doi, len(old))
+                continue
+            for row in old or []:          # start this DOI clean
+                if row.get("file"):
+                    (self.files_dir / row["file"]).unlink(missing_ok=True)
+            meta = self.fetch_meta(doi)
+            # Keep a stem files were already named with; else name afresh (an
+            # earlier run may have had no metadata to name by).
+            had_files = bool(old) and old[0].get("status") == "ok"
+            stem = (old[0].get("stem") if had_files else "") or self.assign_stem(doi, meta)
+            log.info("[%d/%d] %s -> %s", i, len(dois), doi, stem)
+            job = self.harvest(doi, stem, meta)
+            manifest[key] = job.rows()
+            self._write_manifest(manifest)
+            log.info("  = %s", {"ok": f"{len(job.files)} SI file(s)",
+                                "blocked": "blocked, no SI saved",
+                                "error": "network error, no SI saved",
+                                "none": "no SI found"}[job.status])
+
+        selected = [manifest[d.lower()] for d in dois if d.lower() in manifest]
+        self._write_zip(selected)
+        return Summary.from_rows(selected, self.zip_path)
+
+    def close(self) -> None:
+        if self._browser is not None:
+            self._browser.close()
+            self._browser = None
+        self.http.close()
+
+    def assign_stem(self, doi: str, meta: Meta) -> str:
+        base = stem_base(meta.author, meta.year, doi)
+        for suffix in itertools.chain([""], collision_suffixes()):
+            stem = base + suffix
+            owner = self._stems.get(stem)
+            if owner is None or owner == doi.lower():
+                self._stems[stem] = doi.lower()
+                return stem
+        raise AssertionError("unreachable: collision_suffixes is infinite")
+
+    def _is_done(self, rows: list[dict]) -> bool:
+        return all(r.get("status") == "ok" and r.get("file")
+                   and (self.files_dir / r["file"]).is_file() for r in rows)
+
+    # ---- one DOI -----------------------------------------------------
+
+    def harvest(self, doi: str, stem: str, meta: Meta) -> Job:
+        job = Job(doi=doi, stem=stem)
+
+        # 1. APIs and open mirrors.
+        for name, source in (("chemrxiv", self.src_chemrxiv), ("figshare", self.src_figshare),
+                             ("europepmc", self.src_europepmc),
+                             ("elsevier-api", self.src_elsevier_api),
+                             ("linked", self.src_linked_deposits)):
+            try:
+                self._take(job, source(job, meta))
+            except Exception as e:  # a broken source must not sink the DOI
+                log.debug("  %s crashed: %r", name, e)
+                job.note(f"{name}: error ({type(e).__name__})")
+
+        # 2. Publisher pages over plain HTTP.
+        landing, prefetched = self.landing_url(doi)
+        pages = self.pages_for(doi, landing, meta, job.pmcid)
+        for page_url in pages:
+            f = prefetched if prefetched is not None and page_url == landing else \
+                self.http.request(page_url)
+            self._scan_page(job, page_url, f)
+
+        # 3. Predictable SI locations.
+        if not job.complete and self.probe:
+            self._take(job, self.probe_candidates(job, meta))
+
+        # 4. A real browser for what plain HTTP could not get: blocked SI files
+        #    always, blocked or JS-only pages only while no complete SI set is in hand.
+        if job.complete and job.blocked_pages:
+            job.note("pages blocked but SI found elsewhere: " + " ".join(job.blocked_pages))
+        self._browser_pass(job, pages=not job.complete)
+        return job
+
+    def _scan_page(self, job: Job, page_url: str, f: Fetched) -> None:
+        if f.status == 200 and not f.error:
+            page = parse_page(f.text, f.url or page_url)
+            found = si_links(page)
+            if found:
+                self._take(job, [Candidate(u, "page", referer=page.url) for u in found])
+                return
+            if not looks_blocked(f.status, f.text):
+                if len(page.anchors) < 15:   # likely a JS shell: worth a real browser
+                    job.thin_pages.append(page_url)
+                return
+        if looks_blocked(f.status, f.text):
+            job.blocked_pages.append(page_url)
+        elif f.status == 0:
+            job.failed = True
+            job.note(f"page error: {f.error} {page_url}")
+        else:
+            log.debug("  page HTTP %s: %s", f.status, page_url)
+
+    def _take(self, job: Job, items: Iterable) -> None:
+        for item in items:
+            if isinstance(item, Blob):
+                self._store(job, item.content, source=item.source, url=item.url,
+                            names=[item.name], complete=item.complete)
+            else:
+                self._download(job, item)
+
+    def _download(self, job: Job, cand: Candidate,
+                  browser: Optional[BrowserSession] = None) -> None:
+        key = urldefrag(cand.url)[0]
+        if key in job.done_urls:
+            return
+        f = self.http.request(cand.url, referer=cand.referer, accept="*/*", timeout=(10, 120))
+        reason = reject_reason(f)
+        if reason in ("blocked", "html") and browser is not None:
+            f = browser.fetch(cand.url, cand.referer, self.http.max_bytes)
+            reason = reject_reason(f)
+        if reason in ("blocked", "html"):
+            if browser is None:
+                if all(c.url != cand.url for c in job.blocked_files):
+                    job.blocked_files.append(cand)   # retried in the browser pass
+            else:
+                job.blocked = True
+                job.note(f"{cand.source}: still {reason} in browser: {cand.url}")
+            return
+        job.done_urls.add(key)
+        if reason:
+            job.note(f"{cand.source}: {reason}: {cand.url}")
+            return
+        names = [_cd_filename(f.headers.get("content-disposition", "")), cand.name]
+        self._store(job, f.content, source=cand.source, url=f.url or cand.url,
+                    names=names, complete=cand.complete, content_type=f.content_type)
+
+    def _store(self, job: Job, content: bytes, *, source: str, url: str,
+               names: list[str], complete: bool, content_type: str = "") -> None:
+        if complete:
+            job.complete = True
+        sha = hashlib.sha256(content).hexdigest()
+        if sha in job.hashes:   # same file through another route
+            return
+        job.hashes.add(sha)
+        ext = detect_ext(content, names=names, url=url, content_type=content_type)
+        filename = f"{job.stem}_SI{len(job.files) + 1}{ext}"
+        (self.files_dir / filename).write_bytes(content)
+        original = next((n for n in names if n), "") or _name_from_url(url)
+        job.files.append(SIFile(filename, source, original, url, len(content), sha))
+        log.info("  + %s  (%s, %s)", filename, source, _human(len(content)))
+
+    # ---- step 1: APIs and open mirrors ---------------------------------
+
+    def fetch_meta(self, doi: str) -> Meta:
+        meta = Meta()
+        data = self.http.get_json(f"https://api.crossref.org/works/{quote(doi, safe='/')}",
+                                  params={"mailto": self.http.email} if self.http.email else None)
+        msg = (data or {}).get("message") or {}
+        if msg:
+            authors = msg.get("author") or []
+            if authors:
+                meta.author = authors[0].get("family") or authors[0].get("name") or ""
+            for key in ("issued", "published-print", "published-online", "created"):
+                parts = ((msg.get(key) or {}).get("date-parts") or [[None]])[0]
+                if parts and parts[0]:
+                    meta.year = str(parts[0])
+                    break
+            for alt in msg.get("alternative-id") or []:
+                meta.pii = meta.pii or _norm_pii(alt)
+            for link in msg.get("link") or []:
+                m = re.search(r"PII:([^?&]+)", link.get("URL", ""))
+                meta.pii = meta.pii or (_norm_pii(m.group(1)) if m else "")
+            for rel in (msg.get("relation") or {}).get("is-supplemented-by") or []:
+                if rel.get("id-type") == "doi" and rel.get("id"):
+                    meta.supplement_dois.append(normalize_doi(rel["id"]))
+        if not (meta.author and meta.year):
+            work = self.http.get_json(f"https://api.openalex.org/works/doi:{quote(doi, safe='/')}",
+                                      params={"mailto": self.http.email} if self.http.email else None)
+            if work:
+                name = (((work.get("authorships") or [{}])[0].get("author") or {})
+                        .get("display_name") or "")
+                meta.author = meta.author or (name.split()[-1] if name.split() else "")
+                meta.year = meta.year or str(work.get("publication_year") or "")
+        return meta
+
+    def src_chemrxiv(self, job: Job, meta: Meta) -> list:
+        if not job.doi.lower().startswith("10.26434/"):
+            return []
+        item = self.http.get_json("https://chemrxiv.org/engage/chemrxiv/public-api/v1/items/doi/"
+                                  + quote(job.doi, safe="/"))
+        out = []
+        for supp in (item or {}).get("suppItems") or []:
+            asset = supp.get("asset") or {}
+            url = (asset.get("original") or {}).get("url")
+            if url:
+                out.append(Candidate(url, "chemrxiv", name=asset.get("fileName") or ""))
+        return out
+
+    def src_figshare(self, job: Job, meta: Meta) -> list:
+        hits: Any = None
+        for body in ({"resource_doi": job.doi, "page_size": 100},
+                     {"search_for": f':resource_doi: "{job.doi}"', "page_size": 100}):
+            hits = self.http.get_json("https://api.figshare.com/v2/articles/search", json_body=body)
+            if hits:
+                break
+        out, misses = [], 0
+        for hit in (hits if isinstance(hits, list) else [])[:50]:
+            if hit.get("resource_doi") and normalize_doi(hit["resource_doi"]).lower() != job.doi.lower():
+                continue
+            art = self.http.get_json(f"https://api.figshare.com/v2/articles/{hit.get('id')}")
+            # Search is fuzzy: keep only items that name this article as their resource.
+            if art and normalize_doi(art.get("resource_doi") or "").lower() == job.doi.lower():
+                out += self._figshare_files(art, "figshare", complete=True)
+            else:
+                misses += 1
+                if misses >= 5 and not out:   # the search isn't about this article
+                    break
+        return out
+
+    @staticmethod
+    def _figshare_files(art: dict, source: str, complete: bool) -> list:
+        return [Candidate(f["download_url"], source, name=f.get("name") or "", complete=complete)
+                for f in art.get("files") or [] if f.get("download_url")]
+
+    def src_europepmc(self, job: Job, meta: Meta) -> list:
+        data = self.http.get_json(
+            "https://www.ebi.ac.uk/europepmc/webservices/rest/search",
+            params={"query": f'DOI:"{job.doi}"', "format": "json", "resultType": "lite",
+                    "pageSize": 1})
+        results = ((data or {}).get("resultList") or {}).get("result") or []
+        if not results or (results[0].get("doi") or "").lower() != job.doi.lower():
+            return []
+        job.pmcid = results[0].get("pmcid") or ""
+        if not job.pmcid:
+            return []
+        url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/{job.pmcid}/supplementaryFiles"
+        f = self.http.request(url, api=True, accept="application/zip,*/*", timeout=(10, 120))
+        if f.status != 200 or not f.content.startswith(b"PK"):
+            return []
+        return _unzip_blobs(f.content, "europepmc", url, self.http.max_bytes)
+
+    def src_elsevier_api(self, job: Job, meta: Meta) -> list:
+        if not (self.elsevier_key and meta.pii):
+            return []
+        data = self.http.get_json(f"https://api.elsevier.com/content/object/pii/{meta.pii}",
+                                  params={"httpAccept": "application/json"},
+                                  headers={"X-ELS-APIKey": self.elsevier_key})
+        atts = ((data or {}).get("attachment-metadata-response") or {}).get("attachment") or []
+        out = []
+        for att in [atts] if isinstance(atts, dict) else atts:
+            eid = att.get("eid") or ""
+            if re.search(r"-mmc\d+\.[A-Za-z0-9]+$", eid):
+                out.append(Candidate(f"https://ars.els-cdn.com/content/image/{eid}",
+                                     "elsevier-api", name=att.get("filename") or eid))
+        return out
+
+    def src_linked_deposits(self, job: Job, meta: Meta) -> list:
+        """Zenodo / figshare deposits that declare themselves this article's supplement."""
+        deposits = [(d, "") for d in meta.supplement_dois]
+        variants = sorted({job.doi, job.doi.lower()})
+        query = ("relatedIdentifiers.relatedIdentifier:("
+                 + " OR ".join(_lucene_escape(v) for v in variants) + ")")
+        data = self.http.get_json("https://api.datacite.org/dois",
+                                  params={"query": query, "page[size]": 100})
+        for item in (data or {}).get("data") or []:
+            attrs = item.get("attributes") or {}
+            if any(ri.get("relationType") == "IsSupplementTo"
+                   and normalize_doi(ri.get("relatedIdentifier") or "").lower() == job.doi.lower()
+                   for ri in attrs.get("relatedIdentifiers") or []):
+                deposits.append((attrs.get("doi") or item.get("id") or "", attrs.get("url") or ""))
+        out, seen = [], set()
+        for dep_doi, url in deposits:
+            if dep_doi.lower() in seen:
+                continue
+            seen.add(dep_doi.lower())
+            out += self._expand_deposit(job, dep_doi, url)
+        return out
+
+    def _expand_deposit(self, job: Job, dep_doi: str, url: str) -> list:
+        for attempt in range(2):
+            m = (re.search(r"zenodo\.(\d+)", dep_doi, re.IGNORECASE)
+                 or re.search(r"zenodo\.org/records?/(\d+)", url))
+            if m:
+                rec = self.http.get_json(f"https://zenodo.org/api/records/{m.group(1)}")
+                return [Candidate(f["links"].get("self") or f["links"].get("download"), "zenodo",
+                                  name=f.get("key") or f.get("filename") or "", complete=False)
+                        for f in (rec or {}).get("files") or []
+                        if (f.get("links") or {}).get("self") or (f.get("links") or {}).get("download")]
+            m = (re.search(r"figshare\.(\d+)", dep_doi, re.IGNORECASE)
+                 or re.search(r"figshare\.com/articles/(?:[^/?#]+/)*?(\d{4,})(?:/\d+)?/?(?:[?#]|$)", url))
+            if m:
+                art = self.http.get_json(f"https://api.figshare.com/v2/articles/{m.group(1)}")
+                return self._figshare_files(art or {}, "figshare-linked", complete=False)
+            if attempt == 0 and not url:
+                url = self._handle_url(dep_doi)
+        job.note(f"linked deposit not fetched: {dep_doi}")
+        return []
+
+    # ---- step 2: publisher pages -------------------------------------
+
+    def _handle_url(self, doi: str) -> str:
+        data = self.http.get_json(f"https://doi.org/api/handles/{quote(doi, safe='/')}")
+        for value in (data or {}).get("values") or []:
+            if value.get("type") == "URL":
+                return (value.get("data") or {}).get("value") or ""
+        return ""
+
+    def landing_url(self, doi: str) -> tuple[str, Optional[Fetched]]:
+        """Where the DOI points, asked of the handle API so the publisher isn't hit
+        yet; else by following doi.org (that response is kept for reuse)."""
+        url = self._handle_url(doi)
+        if url:
+            return url, None
+        f = self.http.request(f"https://doi.org/{quote(doi, safe='/')}")
+        return f.url or f"https://doi.org/{doi}", f
+
+    @staticmethod
+    def pages_for(doi: str, landing: str, meta: Meta, pmcid: str = "") -> list[str]:
+        u = landing or f"https://doi.org/{doi}"
+        p = urlparse(u)
+        host = (p.hostname or "").lower()
+        root = f"{p.scheme}://{p.netloc}"
+        pages: list[str] = []
+        m = re.search(r"/pii/([^/?#]+)", u, re.IGNORECASE)
+        pii = meta.pii or (_norm_pii(m.group(1)) if m else "")
+        if "elsevier.com" in host or "sciencedirect.com" in host:
+            if pii:
+                pages.append(f"https://www.sciencedirect.com/science/article/pii/{pii}")
+        elif host.endswith("onlinelibrary.wiley.com"):
+            pages += [f"{root}/doi/full/{doi}", u]
+        elif p.path.startswith("/doi/"):   # Atypon: ACS, T&F, SAGE, CSP, Science, PNAS...
+            pages += [f"{root}/doi/suppl/{doi}", u]
+        elif re.search(r"(?:bio|med)rxiv\.org$", host):
+            base = re.sub(r"\.(?:full|abstract|supplementary-material)$", "", u.rstrip("/"))
+            pages.append(base + ".supplementary-material")
+        else:
+            pages.append(u)
+        if pmcid:
+            pages.append(f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/")
+        return list(dict.fromkeys(pages))
+
+    # ---- step 3: probing ---------------------------------------------
+
+    def probe_candidates(self, job: Job, meta: Meta) -> list:
+        doi = job.doi.lower()
+        out: list = []
+        if meta.pii and doi.startswith("10.1016/"):
+            out += self._probe_series(
+                lambda n, ext: f"https://ars.els-cdn.com/content/image/1-s2.0-{meta.pii}-mmc{n}.{ext}",
+                _ELSEVIER_PROBE_EXTS, "elsevier-probe")
+        m = re.fullmatch(r"10\.1039/([a-z]\d[a-z]{2}\d{5}[a-z])", doi)
+        if m:
+            aid = m.group(1)
+            out += self._probe_series(
+                lambda n, ext: f"https://www.rsc.org/suppdata/{aid[:2]}/{aid[2:4]}/{aid}/{aid}{n}.{ext}",
+                _RSC_PROBE_EXTS, "rsc-probe")
+        m = re.fullmatch(r"10\.1371/journal\.([a-z]+)\.\d+", doi)
+        if m and m.group(1) in PLOS_JOURNALS:
+            journal = PLOS_JOURNALS[m.group(1)]
+            out += self._probe_series(
+                lambda n, _: (f"https://journals.plos.org/{journal}/article/file"
+                              f"?type=supplementary&id={job.doi}.s{n:03d}"),
+                ("",), "plos-probe")
+        return out
+
+    def _probe_series(self, make, exts, source: str, limit: int = 30) -> list:
+        """Walk SI1, SI2, ... until an index has no file under any extension."""
+        out = []
+        for n in range(1, limit + 1):
+            hit = next((make(n, ext) for ext in exts if self.http.probe(make(n, ext))), None)
+            if hit is None:
+                break
+            out.append(Candidate(hit, source))
+        return out
+
+    # ---- step 4: real browser ----------------------------------------
+
+    def _get_browser(self) -> Optional[BrowserSession]:
+        if self.browser_mode == "off":
+            return None
+        if self._browser is None:
+            if not BrowserSession.installed():
+                log.warning("Pages were blocked. For the real-browser fallback: "
+                            "pip install playwright && playwright install chromium")
+                self.browser_mode = "off"
+                return None
+            browser = BrowserSession(self.browser_profile, show=self.browser_mode == "show")
+            try:
+                browser.start()
+            except Exception as e:
+                log.warning("Browser fallback unavailable: %s", e)
+                self.browser_mode = "off"
+                return None
+            self._browser = browser
+        return self._browser
+
+    def _browser_pass(self, job: Job, pages: bool = True) -> None:
+        targets = list(dict.fromkeys(job.blocked_pages + job.thin_pages)) if pages else []
+        retry, job.blocked_files = job.blocked_files, []
+        if not targets and not retry:
+            return
+        browser = self._get_browser()
+        if browser is None:
+            if job.blocked_pages or retry:
+                job.blocked = True
+                job.note("blocked: " + " ".join(job.blocked_pages + [c.url for c in retry]))
+            return
+        for page_url in targets:
+            page = browser.open(page_url)
+            if page is not None:
+                self.http.adopt_browser(browser.cookies(), browser.user_agent)
+            found = si_links(page) if page is not None else []
+            if not found and page_url in job.blocked_pages and (page is None or page.blocked):
+                job.blocked = True
+                job.note(f"blocked even in browser: {page_url}")
+            retry += [Candidate(u, "page-browser", referer=page.url) for u in found]
+        for cand in retry:
+            self._download(job, cand, browser=browser)
+
+    # ---- manifest and zip ----------------------------------------------
+
+    def _load_manifest(self) -> dict[str, list[dict]]:
+        manifest: dict[str, list[dict]] = {}
+        if self.manifest_path.exists():
+            with open(self.manifest_path, newline="", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    if row.get("doi"):
+                        manifest.setdefault(row["doi"].lower(), []).append(row)
+        return manifest
+
+    @staticmethod
+    def _csv_text(groups: Iterable[list[dict]]) -> str:
+        buf = io.StringIO()
+        w = csv.DictWriter(buf, fieldnames=MANIFEST_FIELDS, lineterminator="\n")
+        w.writeheader()
+        for rows in groups:
+            for row in rows:
+                w.writerow({k: row.get(k, "") for k in MANIFEST_FIELDS})
+        return buf.getvalue()
+
+    def _write_manifest(self, manifest: dict[str, list[dict]]) -> None:
+        tmp = self.manifest_path.with_suffix(".tmp")
+        tmp.write_text(self._csv_text(manifest.values()), encoding="utf-8")
+        os.replace(tmp, self.manifest_path)
+
+    def _write_zip(self, groups: list[list[dict]]) -> None:
+        tmp = self.zip_path.with_suffix(".tmp")
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+            for rows in groups:
+                for row in rows:
+                    if row.get("status") == "ok" and row.get("file"):
+                        zf.write(self.files_dir / row["file"], arcname=row["file"])
+            zf.writestr("si_manifest.csv", self._csv_text(groups))
+        os.replace(tmp, self.zip_path)
+
+
+def _human(n: int) -> str:
+    return f"{n / 2**20:.1f} MB" if n >= 2**20 else f"{n / 1024:.0f} KB"
+
+
+@dataclass
+class Summary:
+    total: int
+    with_si: int
+    files: int
+    size: int
+    blocked: list[str]
+    errors: list[str]
+    none: list[str]
+    zip_path: Path
+
+    @classmethod
+    def from_rows(cls, groups: list[list[dict]], zip_path: Path) -> "Summary":
+        def with_status(status):
+            return [rows[0]["doi"] for rows in groups if rows and rows[0].get("status") == status]
+        ok = [rows for rows in groups if rows and rows[0].get("status") == "ok"]
+        return cls(
+            total=len(groups), with_si=len(ok),
+            files=sum(len(rows) for rows in ok),
+            size=sum(int(r.get("bytes") or 0) for rows in ok for r in rows),
+            blocked=with_status("blocked"), errors=with_status("error"),
+            none=with_status("none"), zip_path=zip_path,
+        )
+
+    def text(self) -> str:
+        lines = [f"Done: {self.with_si}/{self.total} DOIs with SI, {self.files} files "
+                 f"({_human(self.size)}) -> {self.zip_path}"]
+        if self.blocked:
+            lines.append(f"Blocked ({len(self.blocked)}; try --browser show, or --cookies "
+                         f"from a logged-in browser): " + ", ".join(self.blocked))
+        if self.errors:
+            lines.append(f"Network errors ({len(self.errors)}; rerun to retry): "
+                         + ", ".join(self.errors))
+        if self.none:
+            lines.append(f"No SI found ({len(self.none)}): " + ", ".join(self.none))
+        return "\n".join(lines)
+
+
+# ============================================================
+# CLI
+# ============================================================
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="si_harvest",
+        description="Find and download the Supporting Information of a DOI list, "
+                    "and bundle it into one zip.")
+    p.add_argument("inputs", nargs="+", help=".txt/.csv/.tsv/.xlsx files, or bare DOIs")
+    p.add_argument("-o", "--output", default="si_out", help="output directory (default: si_out)")
+    p.add_argument("--zip", default="SI.zip", help="zip file name in the output dir (default: SI.zip)")
+    p.add_argument("--email", default=None,
+                   help="contact email for the Crossref/OpenAlex polite pools "
+                        "(or $SI_EMAIL / $UNPAYWALL_EMAIL)")
+    p.add_argument("--browser", choices=("auto", "off", "show"), default="auto",
+                   help="real-browser fallback for blocked pages: auto = headless when needed "
+                        "(needs playwright), show = visible window you can interact with, off")
+    p.add_argument("--browser-profile", default=None,
+                   help="persistent Chromium profile (default: ~/.cache/si_harvest/browser-profile)")
+    p.add_argument("--cookies", default=None,
+                   help="Netscape cookies.txt exported from your browser (e.g. institutional login)")
+    p.add_argument("--user-agent", default=None, help="browser User-Agent for publisher pages")
+    p.add_argument("--elsevier-key", default=None,
+                   help="Elsevier API key for the Object API (or $ELSEVIER_API_KEY)")
+    p.add_argument("--delay", type=float, default=1.0,
+                   help="min seconds between requests to one publisher host (default: 1.0)")
+    p.add_argument("--max-mb", type=float, default=200, help="skip files larger than this (default: 200)")
+    p.add_argument("--no-probe", action="store_true", help="don't guess predictable SI URLs")
+    p.add_argument("--overwrite", action="store_true", help="re-harvest DOIs already in the manifest")
+    p.add_argument("-v", "--verbose", action="store_true", help="debug logging")
+    return p
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(message)s")
+    if not args.verbose:  # urllib3 warns on every retry; our notes already say what failed
+        logging.getLogger("urllib3").setLevel(logging.ERROR)
+
+    email = args.email or os.environ.get("SI_EMAIL") or os.environ.get("UNPAYWALL_EMAIL") or ""
+    if not email:
+        log.warning("No --email: Crossref/OpenAlex won't use their polite pools.")
+    dois = read_dois(args.inputs)
+    if not dois:
+        log.error("No DOIs found in the given inputs.")
+        return 2
+
+    http_ = Http(email=email, delay=args.delay, user_agent=args.user_agent,
+                 cookies_file=args.cookies, max_bytes=int(args.max_mb * 2**20))
+    harvester = Harvester(http_, args.output, browser=args.browser,
+                          browser_profile=args.browser_profile,
+                          elsevier_key=args.elsevier_key or os.environ.get("ELSEVIER_API_KEY"),
+                          probe=not args.no_probe, overwrite=args.overwrite, zip_name=args.zip)
+    try:
+        summary = harvester.run(dois)
+    finally:
+        harvester.close()
+    log.info(summary.text())
+    return 0 if summary.with_si else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
