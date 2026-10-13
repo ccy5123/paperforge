@@ -691,6 +691,93 @@ def test_a_host_that_keeps_refusing_goes_straight_to_the_browser(tmp_path):
     assert len(plain.calls) == si.WALL_LIMIT + 1
 
 
+class FakeBrowser:
+    """Stands in for BrowserSession. Headless, it meets a check it cannot pass (a
+    picture puzzle); in a window, ``passes`` says whether the person got through."""
+    made: list = []
+    passes = True
+    SI = "https://files.example.org/x_supp1.pdf"
+
+    def __init__(self, profile_dir, show=False):
+        self.show, self.user_agent = show, "UA"
+        FakeBrowser.made.append(self)
+
+    @staticmethod
+    def installed():
+        return True
+
+    def start(self):
+        pass
+
+    def close(self):
+        pass
+
+    def cookies(self):
+        return []
+
+    def open(self, url):
+        through = self.show and FakeBrowser.passes
+        return si.PageLinks(url=url, anchors=[(self.SI, "Supplementary data")] if through else [],
+                            blocked=not through)
+
+    def fetch(self, url, referer, max_bytes):
+        return si.Fetched(url=url, status=403, content=CHALLENGE,
+                          headers=CaseInsensitiveDict({"content-type": "text/html"}))
+
+
+@pytest.fixture
+def fake_browser(monkeypatch):
+    FakeBrowser.made, FakeBrowser.passes = [], True
+    monkeypatch.setattr(si, "BrowserSession", FakeBrowser)
+    monkeypatch.setattr(si.sys, "platform", "linux")
+    monkeypatch.setenv("DISPLAY", ":0")
+    return FakeBrowser
+
+
+def walled_routes(*dois):
+    routes = {FakeBrowser.SI: FakeResp(200, PDF, {"content-type": "application/pdf"}),
+              "journal.example.org/": FakeResp(403, CHALLENGE, {"content-type": "text/html"})}
+    for doi in dois:
+        routes[f"doi.org/api/handles/{doi}"] = J({"values": [{"type": "URL", "data": {
+            "value": f"https://journal.example.org/article/{doi}"}}]})
+    return routes
+
+
+def run_walled(tmp_path, dois, **kw):
+    h, _ = make_harvester(tmp_path, walled_routes(*dois), probe=False, retries=0, **kw)
+    h.run(dois)
+    rows = read_manifest((tmp_path / "out" / "si_manifest.csv").read_text())
+    return {r["doi"]: r for r in rows}
+
+
+def test_auto_opens_a_window_only_for_a_check_left_standing(tmp_path, fake_browser):
+    rows = run_walled(tmp_path, ["10.5555/a"], browser="auto")
+    assert [b.show for b in fake_browser.made] == [False, True]   # headless first, then one window
+    assert (rows["10.5555/a"]["status"], rows["10.5555/a"]["source"]) == ("ok", "page-browser")
+
+
+def test_headless_mode_never_opens_a_window(tmp_path, fake_browser):
+    rows = run_walled(tmp_path, ["10.5555/a"], browser="headless")
+    assert [b.show for b in fake_browser.made] == [False]
+    assert rows["10.5555/a"]["status"] == "blocked"
+
+
+def test_a_window_nobody_answers_is_the_last_one(tmp_path, fake_browser):
+    fake_browser.passes = False
+    rows = run_walled(tmp_path, ["10.5555/a", "10.5555/b"], browser="auto")
+    assert [b.show for b in fake_browser.made] == [False, True, False]   # no window for b
+    assert [r["status"] for r in rows.values()] == ["blocked", "blocked"]
+    assert "-> window: still walled" in rows["10.5555/a"]["note"]
+
+
+def test_no_window_without_a_screen(tmp_path, fake_browser, monkeypatch):
+    monkeypatch.delenv("DISPLAY")
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    rows = run_walled(tmp_path, ["10.5555/a"], browser="auto")
+    assert [b.show for b in fake_browser.made] == [False]
+    assert rows["10.5555/a"]["status"] == "blocked"
+
+
 def test_skipped_file_types_are_not_downloaded_or_kept(tmp_path):
     mp4 = b"\x00\x00\x00\x18ftypmp42 video"
     h, session = make_harvester(tmp_path, {
@@ -917,6 +1004,15 @@ class _ChallengeSite(BaseHTTPRequestHandler):
                                        b"setTimeout(() => {document.cookie='clear=1; path=/';"
                                        b"location.reload()}, 1500)</script></body></html>", "text/html")
             return self._landing()
+        if path == "/turnstile":          # Cloudflare Turnstile: a box in a cross-origin frame
+            if not cleared:
+                return self._send(403, b"<html><head><title>Just a moment...</title></head><body>"
+                                       b"<iframe src='https://challenges.cloudflare.com/cdn-cgi/challenge-"
+                                       b"platform/h/g/turnstile/f/av0' width='300' height='65'></iframe>"
+                                       b"<script>addEventListener('message', () => {document.cookie="
+                                       b"'clear=1; path=/'; location.reload()})</script></body></html>",
+                                  "text/html")
+            return self._landing()
         if path == "/altcha":             # proof-of-work box: tick it, then the form submits
             if not cleared:
                 return self._send(200, b"<html><body><form method='get' action='/altcha'>"
@@ -1012,6 +1108,27 @@ def test_browser_waits_out_ddos_guard_and_ticks_altcha(tmp_path, challenge_site,
     finally:
         browser.close()
     assert page_ is not None and not page_.blocked
+    assert [u.rsplit("/", 1)[-1] for u in si.si_links(page_)] == list(SI_NAMES)
+
+
+TURNSTILE_BOX = ("<html><body style='margin:0'><input type='checkbox' style='position:absolute;"
+                 "left:15px;top:17px;width:30px;height:30px' onclick=\"parent.postMessage('ok', '*')\">"
+                 "</body></html>")
+
+
+@needs_chromium
+def test_browser_ticks_a_turnstile_box(tmp_path, challenge_site):
+    browser = si.BrowserSession(tmp_path / "profile")
+    browser.start()
+    clicks = []   # the box's frame is served here instead of by Cloudflare
+    browser._ctx.route("https://challenges.cloudflare.com/**", lambda route: (
+        clicks.append(route.request.url),
+        route.fulfill(status=200, content_type="text/html", body=TURNSTILE_BOX)))
+    try:
+        page_ = browser.open(challenge_site + "/turnstile")
+    finally:
+        browser.close()
+    assert clicks and page_ is not None and not page_.blocked
     assert [u.rsplit("/", 1)[-1] for u in si.si_links(page_)] == list(SI_NAMES)
 
 

@@ -4,9 +4,11 @@ Skipped unless SI_LIVE=1; they use the network and take minutes:
 
     SI_LIVE=1 SI_EMAIL=you@example.org pytest tests/test_si_harvest_live.py
 
-Cases marked ``browser`` also need Playwright's Chromium. Cloudflare judges each
-visit anew, so those can fail on one run and pass on the next. The Elsevier case
-uses the Object API when $ELSEVIER_API_KEY is set, else URL probing.
+Cases marked ``browser`` also need Playwright's Chromium; they run headless, with
+no window for a person, so a site that answers with a picture puzzle fails them.
+Cloudflare judges each visit anew, so those can fail on one run and pass on the
+next. The Elsevier case uses the Object API when $ELSEVIER_API_KEY is set, else
+URL probing.
 """
 from __future__ import annotations
 
@@ -52,6 +54,9 @@ CASES = [
      "elsevier-api" if ELSEVIER_KEY else "elsevier-probe", False),  # Elsevier
     ("10.1093/inteam/vjae046", 1, "page-browser", True),            # Oxford University Press
     ("10.26434/chemrxiv-2024-7kqg1", 1, "page-browser", True),      # ChemRxiv
+    # IOP: its /data page, over plain HTTP or, behind Radware's picture puzzle, only
+    # after a person passed it in a window (not in this headless run)
+    ("10.1088/1748-9326/ad3a81", 1, "page", True),
 ]
 
 
@@ -70,7 +75,7 @@ def test_live_harvest(tmp_path, doi, min_files, source, browser):
     if browser and not _chromium_ok():
         pytest.skip("playwright/chromium not available")
     http = si.Http(email=os.environ.get("SI_EMAIL", ""))
-    h = si.Harvester(http, tmp_path / "out", browser="auto" if browser else "off",
+    h = si.Harvester(http, tmp_path / "out", browser="headless" if browser else "off",
                      browser_profile=tmp_path / "profile", elsevier_key=ELSEVIER_KEY, retries=0)
     try:
         h.run([doi])
@@ -80,4 +85,5 @@ def test_live_harvest(tmp_path, doi, min_files, source, browser):
         rows = list(csv.DictReader(fh))
     files = [r for r in rows if r.get("file")]
     assert len(files) >= min_files, rows[0].get("note")
-    assert source in {r["source"] for r in files}
+    # "page" covers "page-browser": the same page, reached by the browser
+    assert any(r["source"].startswith(source) for r in files)

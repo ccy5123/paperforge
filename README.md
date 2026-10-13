@@ -213,9 +213,16 @@ For each DOI it works through these routes, cheapest first:
    walls. Needs `pip install playwright && playwright install chromium`. A file
    the page cannot fetch is opened in its own tab, as a click would, and taken
    from the browser's download (the profile is set to download PDFs rather
-   than display them). With `--browser show` you get a visible window,
-   so you can pass a check or log in through your institution once. The
-   profile (`--browser-profile`) keeps those cookies for later runs.
+   than display them). The browser runs without a window and ticks a
+   Cloudflare Turnstile or hCaptcha box itself; whether that passes is the
+   site's decision. A check still standing after that (in October 2026, IOP's
+   hCaptcha answered the tick with a picture puzzle) is reopened in a visible
+   window for you to pass; the window closes as soon as you are through, or
+   after 3 minutes. If nobody passes anything in a window, no further window
+   opens in that run and the DOI goes to `retry.txt`. `--browser headless`
+   never opens a window; `--browser show` does everything in one, which also
+   lets you log in through your institution once. The profile
+   (`--browser-profile`) keeps the cookies a passed check leaves.
 
 With `pip install curl_cffi`, publisher requests present Chrome's TLS
 fingerprint; in October 2026 that got figshare downloads, Wiley, Canadian
@@ -230,7 +237,7 @@ name (publishers stamp the copy they serve, so it differs from a mirror's).
 
 | Flag | Meaning |
 | --- | --- |
-| `--browser auto\|show\|off` | real-browser fallback (default `auto`: headless, only when needed) |
+| `--browser auto\|headless\|show\|off` | real-browser fallback (default `auto`: headless, plus a window only for a check that needs a person) |
 | `--cookies FILE` | Netscape `cookies.txt` exported from a logged-in browser |
 | `--elsevier-key KEY` | Elsevier API key (or `$ELSEVIER_API_KEY`) |
 | `--delay SEC` | min gap between requests to one publisher host (default 1.0) |

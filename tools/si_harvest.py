@@ -24,14 +24,16 @@ Discovery, per DOI, cheap and reliable routes first:
      key), and deposits that DataCite or Crossref record as supplementing the
      article (Zenodo / figshare).
   2. Publisher pages over plain HTTP: the DOI landing page plus the known SI
-     pages (Atypon ``/doi/suppl/``, Wiley ``/doi/full/``, ScienceDirect,
-     bioRxiv ``.supplementary-material``, PMC), scanned for SI links.
+     pages (Atypon ``/doi/suppl/``, Wiley ``/doi/full/``, IOP ``/data``,
+     ScienceDirect, bioRxiv ``.supplementary-material``, PMC), scanned for SI links.
   3. URL probing, if nothing complete yet: predictable SI locations
      (Elsevier ``ars.els-cdn.com/...-mmcN``, PLOS ``.s00N``).
   4. A real browser, if still nothing: blocked pages (Cloudflare and co.) are
-     reopened in Chromium via Playwright and the SI is fetched inside that
-     browser session. ``--browser show`` opens a visible window so a human can
-     pass a challenge or log in once; the profile keeps those cookies.
+     reopened in a headless Chromium via Playwright, which ticks a Turnstile or
+     hCaptcha box itself, and the SI is fetched inside that browser session. A
+     check still standing (a picture puzzle) is reopened in a visible window for
+     a person; ``--browser headless`` never opens one, ``--browser show`` does
+     everything in a window. The profile keeps the cookies a passed check leaves.
 
 Every download is checked: an HTML page (a login wall or bot challenge) is
 never saved as SI, and the same file reached by two routes is kept once.
@@ -754,7 +756,7 @@ class BrowserSession:
     """A real Chromium for pages that refuse plain HTTP clients.
 
     Uses a persistent profile, so a challenge passed (or an institutional login
-    done) in ``--browser show`` mode is remembered across runs.
+    done) in a visible window is remembered across runs.
     """
 
     _ANCHORS_JS = r"""els => els.map(e => [e.href,
@@ -802,6 +804,12 @@ class BrowserSession:
         return true;
     }"""
 
+    # Human checks that sit in a cross-origin frame and start with one tick of a box:
+    # Cloudflare Turnstile, and hCaptcha (which mostly answers the tick with a picture
+    # puzzle, left to a person). (host, part of the frame URL)
+    _CHECKBOX_FRAMES = (("challenges.cloudflare.com", "/turnstile/"), ("hcaptcha.com", "frame=checkbox"))
+    _TICK_AFTER = 3.0   # seconds a check is left to clear by itself before the tick
+
     # A viewer page that wraps the file rather than serving it: where the file is.
     _EMBEDDED_JS = r"""() => {
         for (const sel of ['iframe#pdf', 'embed#pdf', 'iframe[src*=".pdf"]',
@@ -829,6 +837,8 @@ class BrowserSession:
         self._ctx = None
         self._pages: dict[str, Any] = {}
         self._altcha_ticked: set[tuple[int, str]] = set()
+        # (page, URL) -> when a check was first seen there; None once its box is ticked
+        self._check_seen: dict[tuple[int, str], Optional[float]] = {}
 
     @staticmethod
     def installed() -> bool:
@@ -906,15 +916,40 @@ class BrowserSession:
         return self._ctx.cookies() if self._ctx else []
 
     def _challenged(self, page) -> bool:
-        """Is the page a bot check right now? Ticks an Altcha box on the way."""
+        """Is the page a bot check right now? Ticks an Altcha, Turnstile or hCaptcha
+        box on the way."""
         try:
             kind = page.evaluate(self._CHALLENGE_JS)
             if kind == "altcha":
                 self._tick_altcha(page)
             # the first response's status is stale once a challenge reloads: read the page
-            return bool(kind) or looks_blocked(200, page.content())
+            blocked = bool(kind) or looks_blocked(200, page.content())
         except Exception:
             return True  # mid-navigation
+        if blocked:
+            self._tick_checkbox(page)
+        return blocked
+
+    def _tick_checkbox(self, page) -> None:
+        """Click a Turnstile or hCaptcha box once per page URL, as a person would: the
+        mouse on the box, which lives in a cross-origin frame. The site still decides."""
+        key = (id(page), page.url)
+        first = self._check_seen.setdefault(key, time.monotonic())
+        if first is None or time.monotonic() - first < self._TICK_AFTER:
+            return
+        for frame in page.frames:
+            if not any(host in frame.url and part in frame.url for host, part in self._CHECKBOX_FRAMES):
+                continue
+            try:
+                box = frame.frame_element().bounding_box()
+                if not box or box["width"] < 50:   # not drawn yet: next poll
+                    return
+                self._check_seen[key] = None
+                page.mouse.click(box["x"] + 30, box["y"] + box["height"] / 2)
+                log.debug("  browser: ticked the check box on %s", page.url)
+            except Exception as e:
+                log.debug("  browser: could not tick the check box: %s", e)
+            return
 
     def _tick_altcha(self, page) -> None:
         key = (id(page), page.url)
@@ -1189,9 +1224,10 @@ class Harvester:
         self.pause = pause                   # seconds between two DOIs, drawn uniformly
         self.retries = retries               # extra passes over DOIs left blocked/unreachable
         self.skip_exts = {e.lower().lstrip(".") for e in skip_exts if e}
-        self.browser_mode = browser
+        self.browser_mode = browser          # auto | headless | show | off
         self.browser_profile = Path(browser_profile) if browser_profile else (
             Path.home() / ".cache" / "si_harvest" / "browser-profile")
+        self._windows = True                 # may still open a window for a person (auto)
         self.elsevier_key = elsevier_key
         self.probe = probe
         self.overwrite = overwrite
@@ -1360,38 +1396,38 @@ class Harvester:
         (self.debug_dir / f"{job.stem}_{n}_{kind}_{host}_{f.status}.html").write_bytes(f.content)
 
     def _download(self, job: Job, cand: Candidate,
-                  browser: Optional[BrowserSession] = None) -> None:
+                  browser: Optional[BrowserSession] = None) -> Optional[tuple[str, Fetched]]:
+        """Fetch and store one candidate. With a ``browser``, returns (reason, response)
+        when even the browser was refused, for the caller to judge."""
         key = urldefrag(cand.url)[0]
         if key in job.done_urls:
-            return
+            return None
         ext = _ext_of(cand.name) or _url_ext(cand.url)
         if ext and ext in self.skip_exts:
             job.done_urls.add(key)
             job.note(f"skipped .{ext}: {cand.name or cand.url}")
-            return
+            return None
         f = self.http.request(cand.url, referer=cand.referer, accept="*/*", timeout=(10, 120))
         reason = reject_reason(f)
         if reason in ("blocked", "html") and browser is not None:
             f = browser.fetch(cand.url, cand.referer, self.http.max_bytes)
             reason = reject_reason(f)
         if reason in ("blocked", "html"):
-            if browser is None:
-                if all(c.url != cand.url for c in job.blocked_files):
-                    job.blocked_files.append(cand)   # retried in the browser pass
-            else:
-                job.blocked = True
-                job.note(f"{cand.source}: still {reason} in browser: {cand.url}")
-                self._save_debug(job, f, "file")
-            return
+            if browser is not None:
+                return reason, f
+            if all(c.url != cand.url for c in job.blocked_files):
+                job.blocked_files.append(cand)   # retried in the browser pass
+            return None
         job.done_urls.add(key)
         if reason:
             job.note(f"{cand.source}: {reason}: {cand.url}")
-            return
+            return None
         names = [_cd_filename(f.headers.get("content-disposition", "")), cand.name]
         if f.url and f.url != cand.url:     # a redirect target (signed, short-lived) may name the file
             names.append(_name_from_url(f.url))
         self._store(job, f.content, source=cand.source, url=cand.url,
                     names=names, complete=cand.complete, content_type=f.content_type)
+        return None
 
     def _store(self, job: Job, content: bytes, *, source: str, url: str,
                names: list[str], complete: bool, content_type: str = "") -> None:
@@ -1699,33 +1735,88 @@ class Harvester:
 
     def _browser_pass(self, job: Job, pages: bool = True) -> None:
         targets = list(dict.fromkeys(job.blocked_pages + job.thin_pages)) if pages else []
-        retry, job.blocked_files = job.blocked_files, []
-        if not targets and not retry:
+        files, job.blocked_files = job.blocked_files, []
+        if not targets and not files:
             return
         browser = self._get_browser()
         if browser is None:
-            if job.blocked_pages or retry:
+            if job.blocked_pages or files:
                 job.blocked = True
-                job.note("blocked: " + " ".join(job.blocked_pages + [c.url for c in retry]))
+                job.note("blocked: " + " ".join(job.blocked_pages + [c.url for c in files]))
             return
-        for page_url in targets:
+        walled, refused = self._browse(job, browser, targets, files, "browser")
+        if (walled or any(reason == "blocked" for _, reason, _ in refused)) and self._window_allowed():
+            walled, refused = self._window_pass(job, walled, refused)
+        for page_url in walled:
+            job.blocked = True
+            job.note(f"blocked even in browser: {page_url}")
+        for cand, reason, f in refused:
+            job.blocked = True
+            job.note(f"{cand.source}: still {reason} in browser: {cand.url}")
+            self._save_debug(job, f, "file")
+
+    def _browse(self, job: Job, browser: BrowserSession, pages: list[str],
+                files: list[Candidate], label: str) -> tuple[list[str], list]:
+        """Open ``pages`` and fetch ``files`` (plus the SI the pages list) in ``browser``.
+        Returns the walled pages that stayed walled, and the files refused even there
+        as (candidate, reason, response)."""
+        files, walled = list(files), []
+        for page_url in pages:
             page = browser.open(page_url)
             if page is not None:
                 self.http.adopt_browser(browser.cookies(), browser.user_agent)
             found = si_links(page, job.doi) if page is not None else []
-            log.debug("  browser: %s -> %s", page_url, "not opened" if page is None else
+            log.debug("  %s: %s -> %s", label, page_url, "not opened" if page is None else
                       f"{page.url} (blocked={page.blocked}, {len(page.anchors)} links, "
                       f"{len(found)} SI)")
             outcome = ("not opened" if page is None else f"{len(found)} SI links" if found
                        else "still walled" if page.blocked else "opened, no SI links")
-            job.page_log[page_url] = (job.page_log.get(page_url, "") + " -> browser: " + outcome
+            job.page_log[page_url] = (job.page_log.get(page_url, "") + f" -> {label}: " + outcome
                                       ).lstrip(" ->")
             if not found and page_url in job.blocked_pages and (page is None or page.blocked):
-                job.blocked = True
-                job.note(f"blocked even in browser: {page_url}")
-            retry += [Candidate(u, "page-browser", referer=page.url) for u in found]
-        for cand in retry:
-            self._download(job, cand, browser=browser)
+                walled.append(page_url)
+            files += [Candidate(u, "page-browser", referer=page.url) for u in found]
+        refused = []
+        for cand in files:
+            failure = self._download(job, cand, browser=browser)
+            if failure is not None:
+                refused.append((cand, *failure))
+        return walled, refused
+
+    def _window_allowed(self) -> bool:
+        if self.browser_mode != "auto" or not self._windows:
+            return False
+        # a window needs a screen; on Linux (WSLg included) that is X11 or Wayland
+        return not sys.platform.startswith("linux") or bool(
+            os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+    def _window_pass(self, job: Job, walled: list[str], refused: list) -> tuple[list[str], list]:
+        """Checks the headless browser could not pass (a picture puzzle, say), once more
+        in a visible window for a person. A window in which nothing got through means
+        nobody is there: no further windows in this run."""
+        retry = [cand for cand, reason, _ in refused if reason == "blocked"]
+        kept = [r for r in refused if r[1] != "blocked"]
+        if self._browser is not None:   # one Chromium per profile at a time
+            self._browser.close()
+            self._browser = None
+        window = BrowserSession(self.browser_profile, show=True)
+        try:
+            window.start()
+        except Exception as e:
+            log.warning("  browser: no window could be opened (%s)", e)
+            self._windows = False
+            return walled, refused
+        log.warning("  %s: a check needs a person; pass it in the browser window", job.doi)
+        before = len(job.files)
+        try:
+            still_walled, still_refused = self._browse(job, window, walled, retry, "window")
+        finally:
+            window.close()
+        if len(job.files) == before and len(still_walled) == len(walled):
+            self._windows = False
+            log.warning("  Nothing was passed in the window: no more windows in this run "
+                        "(blocked DOIs go to retry.txt)")
+        return still_walled, kept + still_refused
 
     # ---- manifest and zip ----------------------------------------------
 
@@ -1830,9 +1921,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--email", default=None,
                    help="contact email for the Crossref/OpenAlex polite pools "
                         "(or $SI_EMAIL / $UNPAYWALL_EMAIL)")
-    p.add_argument("--browser", choices=("auto", "off", "show"), default="auto",
-                   help="real-browser fallback for blocked pages: auto = headless when needed "
-                        "(needs playwright), show = visible window you can interact with, off")
+    p.add_argument("--browser", choices=("auto", "headless", "show", "off"), default="auto",
+                   help="real-browser fallback for blocked pages (needs playwright): auto = "
+                        "headless, plus a window only for a check that needs a person; "
+                        "headless = never a window; show = always a window; off")
     p.add_argument("--browser-profile", default=None,
                    help="persistent Chromium profile (default: ~/.cache/si_harvest/browser-profile)")
     p.add_argument("--cookies", default=None,
