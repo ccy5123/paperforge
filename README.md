@@ -181,33 +181,48 @@ Inputs are the same kinds as above (`.txt`, `.csv`/`.tsv`, `.xlsx`, bare
 DOIs). Files are named `<Surname><Year>_SI<n>.<ext>`, with `a`/`b`/… on
 collisions. Runs resume: a DOI already harvested is skipped next time, and
 blocked, failed or empty DOIs are retried; `retry.txt` can be the next run's
-input. `SI.zip` always holds everything harvested into the output directory.
+input. Within a run, DOIs left blocked or unreachable get another pass with a
+fresh browser once the rest are done (`--retries`, default 1). `SI.zip` always
+holds everything harvested into the output directory.
+
+For a DOI that ends with no SI, the manifest's `note` says what each route
+gave, for example `checked mirrors: nothing; https://… opened, no SI links;
+probes (Elsevier mmc): nothing`. That separates "the pages list no SI" from
+"the pages never opened".
 
 For each DOI it works through these routes, cheapest first:
 
 1. **APIs and open mirrors**: figshare (ACS, T&F, SAGE and PLOS mirror their
    SI there), the PMC open-access bucket on AWS (the files the article's PMC
-   XML lists as supplementary material), the Elsevier Object API
-   (`--elsevier-key`), and Zenodo/figshare deposits that DataCite or Crossref
-   record as supplementing the article.
+   XML lists as supplementary material), the Elsevier Object API, and
+   Zenodo/figshare deposits that DataCite or Crossref record as supplementing
+   the article. The Elsevier API (`--elsevier-key` or `$ELSEVIER_API_KEY`)
+   lists an article's objects; its `mmcN` files are the SI, fetched from
+   `ars.els-cdn.com`. An article it lists with no `mmcN` file is recorded as
+   having no SI; no URLs are probed and the browser is not started for it. In
+   October 2026 the API returned the same empty list for a 1980 article and
+   for a PII that does not exist, so an empty list decides nothing.
 2. **Publisher pages**: the landing page plus known SI pages (Atypon
-   `/doi/suppl/`, Wiley `/doi/full/`, ScienceDirect, bioRxiv, PMC), scanned
-   for SI links (ACS, Wiley, Springer Nature, Elsevier, PLOS, RSC, MDPI,
-   Frontiers, OUP, ChemRxiv, …). Links that carry another article's DOI (the
+   `/doi/suppl/`, Wiley `/doi/full/`, IOP `/data`, ScienceDirect, bioRxiv,
+   PMC), scanned for SI links (ACS, Wiley, Springer Nature, Elsevier, PLOS,
+   RSC, MDPI, Frontiers, OUP, ChemRxiv, Copernicus, IOP, …). Links that carry another article's DOI (the
    SI of a cited paper in the reference list) are skipped.
 3. **URL probing**, when nothing complete has turned up yet: Elsevier
    `ars.els-cdn.com/…-mmcN`, PLOS `.s00N`.
 4. **A real browser**, for pages and files behind Cloudflare and similar
    walls. Needs `pip install playwright && playwright install chromium`. A file
    the page cannot fetch is opened in its own tab, as a click would, and taken
-   from the browser's download. With `--browser show` you get a visible window,
+   from the browser's download (the profile is set to download PDFs rather
+   than display them). With `--browser show` you get a visible window,
    so you can pass a check or log in through your institution once. The
    profile (`--browser-profile`) keeps those cookies for later runs.
 
 With `pip install curl_cffi`, publisher requests present Chrome's TLS
 fingerprint; in October 2026 that got figshare downloads, Wiley, Canadian
 Science Publishing and link.springer.com pages through without a browser. A
-host that refuses it is retried over plain `requests`.
+host that refuses it is retried over plain `requests`. A host that has
+refused every client tried, twice in a row, is not asked again over plain
+HTTP in that pass; its pages and files go straight to the browser.
 
 Downloads that come back as HTML (a login wall or bot check) are never saved
 as SI. A file reached by two routes is kept once: same bytes, or same file
@@ -222,6 +237,8 @@ name (publishers stamp the copy they serve, so it differs from a mirror's).
 | `--pause MIN MAX` | random pause between two DOIs (default 2 4) |
 | `--no-impersonate` | plain `requests` even when `curl_cffi` is installed |
 | `--max-mb N` | skip files larger than N MB (default 200) |
+| `--skip-ext EXTS` | file types not to download, comma-separated (e.g. `mp4,avi,h5`) |
+| `--retries N` | extra passes over DOIs left blocked or unreachable (default 1) |
 | `--no-probe` / `--overwrite` / `--zip NAME` | no URL guessing / re-harvest everything / zip file name |
 
 ## Library use

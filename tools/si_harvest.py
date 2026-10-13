@@ -105,10 +105,11 @@ _FAST_HOSTS = {
 }
 
 BLOCK_STATUSES = {401, 403, 429, 503}
+WALL_LIMIT = 2         # refusals in a row after which a host goes straight to the browser
 _RETRY_STATUSES = {429, 500, 502, 504}
 
 # Bot walls (Cloudflare, Akamai, Imperva, PerimeterX, DataDome, Fastly, DDoS-Guard,
-# Google reCAPTCHA, Altcha). Only checked on small pages: real article pages are
+# Radware, Google reCAPTCHA, Altcha). Only checked on small pages: real article pages are
 # far larger, and Cloudflare injects its challenge-platform script into ordinary
 # pages too.
 _BLOCK_MARKERS = (
@@ -117,12 +118,12 @@ _BLOCK_MARKERS = (
     "px-captcha", "_incapsula_resource", "captcha-delivery", "access denied",
     "request unsuccessful", "are you a robot", "unusual traffic",
     "enable javascript and cookies", "<title>client challenge</title>", "bm-verify=",
-    "ddos-guard", "<altcha-widget",
+    "ddos-guard", "<altcha-widget", "radware bot manager", "cdn.perfdrive.com",
 )
 
 _WALL_TITLES = ("just a moment", "client challenge", "attention required", "ddos-guard",
                 "are you a robot", "checking your browser", "verify you are human",
-                "access denied")
+                "access denied", "radware bot manager")
 
 PMC_BUCKET = "https://pmc-oa-opendata.s3.amazonaws.com"
 
@@ -152,6 +153,7 @@ _SI_URL_RE = re.compile("|".join([
     r"frontiersin\.org/api/v\d+/articles/\d+/file/",  # Frontiers data sheets
     r"mdpi\.com/[^?#]+/s\d+(?:[?#]|$)",           # MDPI .../s1
     r"ncbi\.nlm\.nih\.gov/(?:pmc/)?articles/[^?#]+/bin/",  # PMC
+    r"iop(?:-org|\.org)[^?#]*/[a-z]+[a-z0-9]+supp\d+\.",  # IOP: erlad3a81supp1.pdf
 ]), re.IGNORECASE)
 
 _SI_WORDS = re.compile(
@@ -175,7 +177,12 @@ PLOS_JOURNALS = {
     "pstr": "sustainabilitytransformation", "pmen": "mentalhealth",
     "pcsy": "complexsystems",
 }
-_ELSEVIER_PROBE_EXTS = ("pdf", "docx", "xlsx", "doc", "xls", "zip", "csv", "txt", "pptx", "mp4")
+# ScienceDirect itself rarely opens to a script, so these guesses are the Elsevier route:
+# commonest first, then figures, media, archives and data formats.
+_ELSEVIER_PROBE_EXTS = ("pdf", "docx", "xlsx", "doc", "xls", "zip", "csv", "txt", "pptx", "mp4",
+                        "jpg", "tif", "png", "gif", "xml", "avi", "mov", "wmv", "mp3", "wav",
+                        "rar", "7z", "gz", "ppt", "rtf", "odt", "sdf", "cif", "mol", "kmz",
+                        "mat", "py", "r", "eps")
 
 MANIFEST_FIELDS = ["doi", "stem", "status", "file", "source", "original_name",
                    "url", "bytes", "sha256", "note"]
@@ -324,11 +331,14 @@ class Http:
             web_session = curl_requests.Session(impersonate=impersonate)
         self.web = web_session
         self._plain_hosts: set[str] = set()  # hosts that refuse curl_cffi but not requests
+        self._walls: dict[str, int] = {}     # host -> refusals in a row, by every client
         self._last: dict[str, float] = {}
         if cookies_file:
             jar = http.cookiejar.MozillaCookieJar(str(cookies_file))
             jar.load(ignore_discard=True, ignore_expires=True)
             for cookie in jar:
+                if not cookie.expires:   # exporters write 0 for a session cookie, not 1970
+                    cookie.expires, cookie.discard = None, True
                 self.session.cookies.set_cookie(cookie)
                 if self.web is not None:
                     self.web.cookies.set(cookie.name, cookie.value, domain=cookie.domain,
@@ -411,16 +421,29 @@ class Http:
         kw = dict(referer=referer, accept=accept, params=params, json_body=json_body,
                   headers=headers, timeout=timeout)
         host = (urlparse(url).hostname or "").lower()
-        if api or self.web is None or host in self._plain_hosts:
-            return self._send(self.session, url, api=api, **kw)
-        f = self._send(self.web, url, impersonating=True, **kw)
-        if f.status and not _refused(f):
-            return f
-        g = self._send(self.session, url, **kw)
-        if g.status and not _refused(g):
-            self._plain_hosts.add(host)
-            return g
-        return f if f.status else g
+        if api:
+            return self._send(self.session, url, api=True, **kw)
+        if self._walls.get(host, 0) >= WALL_LIMIT:   # straight to the browser
+            log.debug("  %s keeps refusing plain HTTP; not asked again: %s", host, url)
+            return Fetched(url=url, status=403, error="", headers=CaseInsensitiveDict(
+                {"x-si-skipped": "walled host"}))
+        if self.web is None or host in self._plain_hosts:
+            f = self._send(self.session, url, **kw)
+        else:
+            f = self._send(self.web, url, impersonating=True, **kw)
+            if not f.status or _refused(f):
+                g = self._send(self.session, url, **kw)
+                if g.status and not _refused(g):
+                    self._plain_hosts.add(host)
+                f = g if g.status and (not _refused(g) or not f.status) else f
+        if f.status and _refused(f):
+            self._walls[host] = self._walls.get(host, 0) + 1
+        elif f.status:
+            self._walls.pop(host, None)
+        return f
+
+    def reset_walls(self) -> None:
+        self._walls.clear()
 
     def _send(self, session, url: str, *, api: bool = False, impersonating: bool = False,
               referer=None, accept=None, params=None, json_body=None, headers=None,
@@ -465,9 +488,9 @@ class Http:
         finally:
             r.close()
 
-    def get_json(self, url: str, **kw) -> Any:
+    def get_json(self, url: str, *, ok: tuple = (200,), **kw) -> Any:
         f = self.request(url, api=True, **kw)
-        if f.status != 200:
+        if f.status not in ok:
             return None
         try:
             return json.loads(f.content)
@@ -663,7 +686,8 @@ def _cd_filename(cd: str) -> str:
     if m:
         return unquote(m.group(1).strip().strip('"'))
     m = re.search(r'filename\s*=\s*"?([^";]+)"?', cd, re.IGNORECASE)
-    return m.group(1).strip() if m else ""
+    # figshare's S3 percent-encodes this one too; Chrome decodes it, so do we
+    return unquote(m.group(1).strip()) if m else ""
 
 
 def _name_from_url(url: str) -> str:
@@ -817,6 +841,7 @@ class BrowserSession:
     def start(self) -> None:
         from playwright.sync_api import sync_playwright
         self.profile_dir.mkdir(parents=True, exist_ok=True)
+        self._download_pdfs()
         self._pw = sync_playwright().start()
         try:
             self._ctx = self._launch(None)
@@ -829,6 +854,20 @@ class BrowserSession:
         except Exception:
             self.close()
             raise
+
+    def _download_pdfs(self) -> None:
+        """A PDF Chromium shows in its viewer reaches Playwright as the viewer's HTML,
+        not the file; with this profile preference set, Chromium downloads it."""
+        path = self.profile_dir / "Default" / "Preferences"
+        try:
+            prefs = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            prefs = {}
+        if not isinstance(prefs.get("plugins"), dict):
+            prefs["plugins"] = {}
+        prefs["plugins"]["always_open_pdf_externally"] = True
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(prefs), encoding="utf-8")
 
     def _launch(self, user_agent: Optional[str]):
         kw: dict = dict(headless=not self.show, accept_downloads=True, locale="en-US",
@@ -1066,7 +1105,10 @@ class Job:
     files: list[SIFile] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     hashes: set[str] = field(default_factory=set)
-    names: set[str] = field(default_factory=set)     # original file names, lowercased
+    names: dict[str, str] = field(default_factory=dict)   # original name (lowercased) -> source
+    mirror_hits: dict[str, int] = field(default_factory=dict)  # API/mirror source -> candidates
+    page_log: dict[str, str] = field(default_factory=dict)     # page URL -> what it gave
+    probed: list[str] = field(default_factory=list)            # probe sources that ran
     done_urls: set[str] = field(default_factory=set)
     blocked_pages: list[str] = field(default_factory=list)
     thin_pages: list[str] = field(default_factory=list)
@@ -1079,6 +1121,15 @@ class Job:
     def note(self, message: str) -> None:
         if message not in self.notes:
             self.notes.append(message)
+
+    def explain(self) -> None:
+        """For a DOI that ends without files: what each route gave, so the manifest
+        tells "the pages say there is no SI" from "the pages never opened"."""
+        mirrors = ", ".join(f"{k} {v}" for k, v in self.mirror_hits.items() if v) or "nothing"
+        parts = [f"mirrors: {mirrors}"] + [f"{u} {o}" for u, o in self.page_log.items()]
+        if self.probed:
+            parts.append("probes (" + ", ".join(self.probed) + "): nothing")
+        self.note("checked " + "; ".join(parts))
 
     @property
     def status(self) -> str:
@@ -1125,7 +1176,8 @@ class Harvester:
     def __init__(self, http: Http, out_dir, *, browser: str = "auto",
                  browser_profile=None, elsevier_key: Optional[str] = None,
                  probe: bool = True, overwrite: bool = False, zip_name: str = "SI.zip",
-                 pause: tuple[float, float] = (0.0, 0.0)):
+                 pause: tuple[float, float] = (0.0, 0.0), retries: int = 1,
+                 skip_exts: Iterable[str] = ()):
         self.http = http
         self.out_dir = Path(out_dir)
         self.files_dir = self.out_dir / "files"
@@ -1135,6 +1187,8 @@ class Harvester:
         self.cache_path = self.out_dir / ".metadata_cache.json"
         self.zip_path = self.out_dir / zip_name
         self.pause = pause                   # seconds between two DOIs, drawn uniformly
+        self.retries = retries               # extra passes over DOIs left blocked/unreachable
+        self.skip_exts = {e.lower().lstrip(".") for e in skip_exts if e}
         self.browser_mode = browser
         self.browser_profile = Path(browser_profile) if browser_profile else (
             Path.home() / ".cache" / "si_harvest" / "browser-profile")
@@ -1154,33 +1208,28 @@ class Harvester:
                 self._stems.setdefault(rows[0]["stem"], rows[0]["doi"].lower())
         cache = self._load_cache()
 
-        worked = False
+        worked: list[str] = []
         for i, doi in enumerate(dois, start=1):
-            key = doi.lower()
-            old = manifest.get(key)
+            old = manifest.get(doi.lower())
             if old and not self.overwrite and self._is_done(old):
                 log.info("[%d/%d] %s -> already harvested (%d files)",
                          i, len(dois), doi, len(old))
                 continue
-            if worked and self.pause[1] > 0:
-                time.sleep(random.uniform(*self.pause))
-            worked = True
-            for row in old or []:          # start this DOI clean
-                if row.get("file"):
-                    (self.files_dir / row["file"]).unlink(missing_ok=True)
-            meta = self._cached_meta(doi, cache)
-            # Keep a stem files were already named with; else name afresh (an
-            # earlier run may have had no metadata to name by).
-            had_files = bool(old) and old[0].get("status") == "ok"
-            stem = (old[0].get("stem") if had_files else "") or self.assign_stem(doi, meta)
-            log.info("[%d/%d] %s -> %s", i, len(dois), doi, stem)
-            job = self.harvest(doi, stem, meta)
-            manifest[key] = job.rows()
-            self._write_manifest(manifest)
-            log.info("  = %s", {"ok": f"{len(job.files)} SI file(s)",
-                                "blocked": "blocked, no SI saved",
-                                "error": "network error, no SI saved",
-                                "none": "no SI found"}[job.status])
+            self._process(doi, f"{i}/{len(dois)}", manifest, cache, pause=bool(worked))
+            worked.append(doi)
+
+        # Bot walls judge each visit anew: what one pass could not open, the next may.
+        for round_ in range(1, self.retries + 1):
+            again = [d for d in worked if manifest[d.lower()][0].get("status") in ("blocked", "error")]
+            if not again:
+                break
+            log.info("Retry %d: %d DOI(s) blocked or unreachable", round_, len(again))
+            if self._browser is not None:        # a fresh browser for a fresh look
+                self._browser.close()
+                self._browser = None
+            self.http.reset_walls()
+            for i, doi in enumerate(again, start=1):
+                self._process(doi, f"retry {round_}, {i}/{len(again)}", manifest, cache, pause=True)
 
         # The whole output directory, not just this run's DOIs: a rerun of retry.txt
         # must leave SI.zip complete.
@@ -1189,6 +1238,28 @@ class Harvester:
         summary = Summary.from_rows(groups, self.zip_path)
         self._write_retry(summary.blocked + summary.errors)
         return summary
+
+    def _process(self, doi: str, label: str, manifest: dict, cache: dict, pause: bool) -> None:
+        if pause and self.pause[1] > 0:
+            time.sleep(random.uniform(*self.pause))
+        key = doi.lower()
+        old = manifest.get(key)
+        for row in old or []:          # start this DOI clean
+            if row.get("file"):
+                (self.files_dir / row["file"]).unlink(missing_ok=True)
+        meta = self._cached_meta(doi, cache)
+        # Keep a stem files were already named with; else name afresh (an
+        # earlier run may have had no metadata to name by).
+        had_files = bool(old) and old[0].get("status") == "ok"
+        stem = (old[0].get("stem") if had_files else "") or self.assign_stem(doi, meta)
+        log.info("[%s] %s -> %s", label, doi, stem)
+        job = self.harvest(doi, stem, meta)
+        manifest[key] = job.rows()
+        self._write_manifest(manifest)
+        log.info("  = %s", {"ok": f"{len(job.files)} SI file(s)",
+                            "blocked": "blocked, no SI saved",
+                            "error": "network error, no SI saved",
+                            "none": "no SI found"}[job.status])
 
     def close(self) -> None:
         if self._browser is not None:
@@ -1220,7 +1291,9 @@ class Harvester:
                              ("elsevier-api", self.src_elsevier_api),
                              ("linked", self.src_linked_deposits)):
             try:
-                self._take(job, source(job, meta))
+                found = source(job, meta)
+                job.mirror_hits[name] = len(found)
+                self._take(job, found)
             except Exception as e:  # a broken source must not sink the DOI
                 log.debug("  %s crashed: %r", name, e)
                 job.note(f"{name}: error ({type(e).__name__})")
@@ -1239,9 +1312,11 @@ class Harvester:
 
         # 4. A real browser for what plain HTTP could not get: blocked SI files
         #    always, blocked or JS-only pages only while no complete SI set is in hand.
-        if job.complete and job.blocked_pages:
+        if job.files and job.complete and job.blocked_pages:
             job.note("pages blocked but SI found elsewhere: " + " ".join(job.blocked_pages))
         self._browser_pass(job, pages=not job.complete)
+        if not job.files:
+            job.explain()
         return job
 
     def _scan_page(self, job: Job, page_url: str, f: Fetched) -> None:
@@ -1250,19 +1325,25 @@ class Harvester:
             page = parse_page(f.text, f.url or page_url)
             found = si_links(page, job.doi)
             if found:
+                job.page_log[page_url] = f"{len(found)} SI links"
                 self._take(job, [Candidate(u, "page", referer=page.url) for u in found])
                 return
             if not blocked:
+                job.page_log[page_url] = "opened, no SI links"
                 if len(page.anchors) < 15:   # likely a JS shell: worth a real browser
                     job.thin_pages.append(page_url)
                 return
         if blocked:
+            job.page_log[page_url] = ("skipped (host keeps refusing)" if f.headers.get("x-si-skipped")
+                                      else f"walled (HTTP {f.status})")
             job.blocked_pages.append(page_url)
             self._save_debug(job, f, "page")
         elif f.status == 0:
+            job.page_log[page_url] = f"error ({f.error})"
             job.failed = True
             job.note(f"page error: {f.error} {page_url}")
         else:
+            job.page_log[page_url] = f"HTTP {f.status}"
             log.debug("  page HTTP %s: %s", f.status, page_url)
 
     def _take(self, job: Job, items: Iterable[Candidate]) -> None:
@@ -1282,6 +1363,11 @@ class Harvester:
                   browser: Optional[BrowserSession] = None) -> None:
         key = urldefrag(cand.url)[0]
         if key in job.done_urls:
+            return
+        ext = _ext_of(cand.name) or _url_ext(cand.url)
+        if ext and ext in self.skip_exts:
+            job.done_urls.add(key)
+            job.note(f"skipped .{ext}: {cand.name or cand.url}")
             return
         f = self.http.request(cand.url, referer=cand.referer, accept="*/*", timeout=(10, 120))
         reason = reject_reason(f)
@@ -1317,12 +1403,19 @@ class Harvester:
         # bytes can differ from a mirror's (ACS vs figshare): a real file name decides
         # too (not a bare "download" or a numeric id).
         name_key = original.lower() if _ext_of(original) else ""
-        if sha in job.hashes or (name_key and name_key in job.names):
+        if sha in job.hashes:
+            return
+        if name_key in job.names:
+            job.note(f"{original}: {job.names[name_key]} and {source} copies differ; "
+                     f"kept the {job.names[name_key]} one")
+            return
+        ext = detect_ext(content, names=names, url=url, content_type=content_type)
+        if ext.lstrip(".") in self.skip_exts:
+            job.note(f"skipped {ext}: {original or url}")
             return
         job.hashes.add(sha)
         if name_key:
-            job.names.add(name_key)
-        ext = detect_ext(content, names=names, url=url, content_type=content_type)
+            job.names[name_key] = source
         filename = f"{job.stem}_SI{len(job.files) + 1}{ext}"
         (self.files_dir / filename).write_bytes(content)
         job.files.append(SIFile(filename, source, original, url, len(content), sha))
@@ -1444,18 +1537,26 @@ class Harvester:
         return [Candidate(f"{PMC_BUCKET}/{latest}/{quote(n)}", "pmc", name=n) for n in names]
 
     def src_elsevier_api(self, job: Job, meta: Meta) -> list:
+        """The article's objects as the Object API lists them (HTTP 300, one "choice"
+        each): SI is ``mmcN``; the rest are figures, formula images and the accepted
+        manuscript. The files come from ars.els-cdn.com, which needs no key."""
         if not (self.elsevier_key and meta.pii):
             return []
         data = self.http.get_json(f"https://api.elsevier.com/content/object/pii/{meta.pii}",
-                                  params={"httpAccept": "application/json"},
+                                  ok=(200, 300), params={"httpAccept": "application/json"},
                                   headers={"X-ELS-APIKey": self.elsevier_key})
-        atts = ((data or {}).get("attachment-metadata-response") or {}).get("attachment") or []
+        # An unknown PII gets {"choices": null} too, so only a non-empty list says anything.
+        choices = ((data if isinstance(data, dict) else {}).get("choices") or {}).get("choice") or []
+        choices = [choices] if isinstance(choices, dict) else choices
         out = []
-        for att in [atts] if isinstance(atts, dict) else atts:
-            eid = att.get("eid") or ""
-            if re.search(r"-mmc\d+\.[A-Za-z0-9]+$", eid):
-                out.append(Candidate(f"https://ars.els-cdn.com/content/image/{eid}",
-                                     "elsevier-api", name=att.get("filename") or eid))
+        for c in choices:
+            name = urlparse(c.get("$") or "").path.rsplit("/", 1)[-1]
+            if re.fullmatch(r"mmc\d+", c.get("@ref") or "") and name:
+                out.append(Candidate(f"https://ars.els-cdn.com/content/image/{quote(name)}",
+                                     "elsevier-api", name=name, complete=True))
+        if choices and not out:   # the article is listed and has no SI object
+            job.complete = True
+            job.note("Elsevier API lists no supplementary files")
         return out
 
     def src_linked_deposits(self, job: Job, meta: Meta) -> list:
@@ -1534,6 +1635,8 @@ class Harvester:
             pages += [f"{root}/doi/full/{doi}", u]
         elif p.path.startswith("/doi/"):   # Atypon: ACS, T&F, SAGE, CSP, Science, PNAS...
             pages += [f"{root}/doi/suppl/{doi}", u]
+        elif host == "iopscience.iop.org" and p.path.startswith("/article/"):
+            pages += [u.rstrip("/") + "/data", u]   # IOP lists SI on a page of its own
         elif re.search(r"(?:bio|med)rxiv\.org$", host):
             base = re.sub(r"\.(?:full|abstract|supplementary-material)$", "", u.rstrip("/"))
             pages.append(base + ".supplementary-material")
@@ -1549,11 +1652,13 @@ class Harvester:
         doi = job.doi.lower()
         out: list = []
         if meta.pii and doi.startswith("10.1016/"):
+            job.probed.append("Elsevier mmc")
             out += self._probe_series(
                 lambda n, ext: f"https://ars.els-cdn.com/content/image/1-s2.0-{meta.pii}-mmc{n}.{ext}",
                 _ELSEVIER_PROBE_EXTS, "elsevier-probe")
         m = re.fullmatch(r"10\.1371/journal\.([a-z]+)\.\d+", doi)
         if m and m.group(1) in PLOS_JOURNALS:
+            job.probed.append("PLOS .s00N")
             journal = PLOS_JOURNALS[m.group(1)]
             out += self._probe_series(
                 lambda n, _: (f"https://journals.plos.org/{journal}/article/file"
@@ -1611,6 +1716,10 @@ class Harvester:
             log.debug("  browser: %s -> %s", page_url, "not opened" if page is None else
                       f"{page.url} (blocked={page.blocked}, {len(page.anchors)} links, "
                       f"{len(found)} SI)")
+            outcome = ("not opened" if page is None else f"{len(found)} SI links" if found
+                       else "still walled" if page.blocked else "opened, no SI links")
+            job.page_log[page_url] = (job.page_log.get(page_url, "") + " -> browser: " + outcome
+                                      ).lstrip(" ->")
             if not found and page_url in job.blocked_pages and (page is None or page.blocked):
                 job.blocked = True
                 job.note(f"blocked even in browser: {page_url}")
@@ -1737,6 +1846,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="random pause between two DOIs, in seconds (default: 2 4)")
     p.add_argument("--no-impersonate", action="store_true",
                    help="use plain requests even when curl_cffi is installed")
+    p.add_argument("--retries", type=int, default=1,
+                   help="extra passes over DOIs left blocked or unreachable (default: 1)")
+    p.add_argument("--skip-ext", default="", metavar="EXTS",
+                   help="file types not to download, comma-separated (e.g. mp4,avi,mov)")
     p.add_argument("--max-mb", type=float, default=200, help="skip files larger than this (default: 200)")
     p.add_argument("--no-probe", action="store_true", help="don't guess predictable SI URLs")
     p.add_argument("--overwrite", action="store_true", help="re-harvest DOIs already in the manifest")
@@ -1768,7 +1881,8 @@ def main(argv=None) -> int:
                           browser_profile=args.browser_profile,
                           elsevier_key=args.elsevier_key or os.environ.get("ELSEVIER_API_KEY"),
                           probe=not args.no_probe, overwrite=args.overwrite, zip_name=args.zip,
-                          pause=tuple(args.pause))
+                          pause=tuple(args.pause), retries=args.retries,
+                          skip_exts=args.skip_ext.split(","))
     try:
         summary = harvester.run(dois)
     finally:
