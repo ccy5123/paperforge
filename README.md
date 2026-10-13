@@ -172,33 +172,46 @@ si_out/
   files/Smith2012_SI1.pdf, Smith2012_SI2.xlsx, Konemann2018_SI1.pdf, ...
   si_manifest.csv     # doi, stem, status, file, source, original_name, url, bytes, sha256, note
   SI.zip              # the files, flat, plus si_manifest.csv
+  retry.txt           # DOIs that were blocked or unreachable: rerun with this file as input
+  debug/              # the HTML a site sent instead of a page or file
+  .metadata_cache.json  # Crossref answers, so a rerun does not ask again
 ```
 
 Inputs are the same kinds as above (`.txt`, `.csv`/`.tsv`, `.xlsx`, bare
 DOIs). Files are named `<Surname><Year>_SI<n>.<ext>`, with `a`/`b`/… on
 collisions. Runs resume: a DOI already harvested is skipped next time, and
-blocked, failed or empty DOIs are retried.
+blocked, failed or empty DOIs are retried; `retry.txt` can be the next run's
+input. `SI.zip` always holds everything harvested into the output directory.
 
 For each DOI it works through these routes, cheapest first:
 
-1. **APIs and open mirrors**: ChemRxiv API, figshare (ACS, T&F, SAGE and
-   PLOS mirror their SI there), the Europe PMC supplementary bundle, the
-   Elsevier Object API (`--elsevier-key`), and Zenodo/figshare deposits that
-   DataCite or Crossref record as supplementing the article.
+1. **APIs and open mirrors**: figshare (ACS, T&F, SAGE and PLOS mirror their
+   SI there), the PMC open-access bucket on AWS (the files the article's PMC
+   XML lists as supplementary material), the Elsevier Object API
+   (`--elsevier-key`), and Zenodo/figshare deposits that DataCite or Crossref
+   record as supplementing the article.
 2. **Publisher pages**: the landing page plus known SI pages (Atypon
    `/doi/suppl/`, Wiley `/doi/full/`, ScienceDirect, bioRxiv, PMC), scanned
    for SI links (ACS, Wiley, Springer Nature, Elsevier, PLOS, RSC, MDPI,
-   Frontiers, OUP, …).
+   Frontiers, OUP, ChemRxiv, …). Links that carry another article's DOI (the
+   SI of a cited paper in the reference list) are skipped.
 3. **URL probing**, when nothing complete has turned up yet: Elsevier
-   `ars.els-cdn.com/…-mmcN`, RSC `suppdata`, PLOS `.s00N`.
-4. **A real browser**, for pages behind Cloudflare and similar walls. Needs
-   `pip install playwright && playwright install chromium`. With `--browser
-   show` you get a visible window, so you can pass a check or log in through
-   your institution once. The profile (`--browser-profile`) keeps those
-   cookies for later runs.
+   `ars.els-cdn.com/…-mmcN`, PLOS `.s00N`.
+4. **A real browser**, for pages and files behind Cloudflare and similar
+   walls. Needs `pip install playwright && playwright install chromium`. A file
+   the page cannot fetch is opened in its own tab, as a click would, and taken
+   from the browser's download. With `--browser show` you get a visible window,
+   so you can pass a check or log in through your institution once. The
+   profile (`--browser-profile`) keeps those cookies for later runs.
+
+With `pip install curl_cffi`, publisher requests present Chrome's TLS
+fingerprint; in October 2026 that got figshare downloads, Wiley, Canadian
+Science Publishing and link.springer.com pages through without a browser. A
+host that refuses it is retried over plain `requests`.
 
 Downloads that come back as HTML (a login wall or bot check) are never saved
-as SI, and a file reached by two routes is kept only once.
+as SI. A file reached by two routes is kept once: same bytes, or same file
+name (publishers stamp the copy they serve, so it differs from a mirror's).
 
 | Flag | Meaning |
 | --- | --- |
@@ -206,6 +219,8 @@ as SI, and a file reached by two routes is kept only once.
 | `--cookies FILE` | Netscape `cookies.txt` exported from a logged-in browser |
 | `--elsevier-key KEY` | Elsevier API key (or `$ELSEVIER_API_KEY`) |
 | `--delay SEC` | min gap between requests to one publisher host (default 1.0) |
+| `--pause MIN MAX` | random pause between two DOIs (default 2 4) |
+| `--no-impersonate` | plain `requests` even when `curl_cffi` is installed |
 | `--max-mb N` | skip files larger than N MB (default 200) |
 | `--no-probe` / `--overwrite` / `--zip NAME` | no URL guessing / re-harvest everything / zip file name |
 
