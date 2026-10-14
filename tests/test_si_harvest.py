@@ -251,6 +251,9 @@ def test_looks_blocked():
                "</script></head><body><h1>Are you a robot?</h1><p>Please confirm you are a human by "
                "completing the captcha challenge below.</p>" + "<i>x</i>" * 50000 + "</body></html>")
     assert si.looks_blocked(200, sd_wall)
+    # ... and while its box is redrawn, the same page is titled plain "ScienceDirect"
+    sd_redraw = sd_wall.replace("<title>Just a moment...</title>", "<title>ScienceDirect</title>")
+    assert si.looks_blocked(200, sd_redraw)
     big_article = "<html><body>" + "<p>Results and discussion of the access denied rate.</p>" * 2000
     assert not si.looks_blocked(200, big_article)
     # figshare's download host: AWS WAF wants JavaScript first

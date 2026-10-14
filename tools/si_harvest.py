@@ -123,6 +123,10 @@ _BLOCK_MARKERS = (
     "ddos-guard", "<altcha-widget", "radware bot manager", "cdn.perfdrive.com",
 )
 
+# Wording only a wall uses, checked at any page size: ScienceDirect's captcha page runs
+# to 1.2 MB and, while its box is redrawn, is titled plain "ScienceDirect".
+_WALL_PHRASES = ("confirm you are a human by completing the captcha",)
+
 _WALL_TITLES = ("just a moment", "client challenge", "attention required", "ddos-guard",
                 "are you a robot", "checking your browser", "verify you are human",
                 "access denied", "radware bot manager")
@@ -533,6 +537,8 @@ def looks_blocked(status: int, text: str, headers: Any = None) -> bool:
     # A wall's title gives it away at any size (ScienceDirect's runs to 1.2 MB of script)
     title = re.search(r"<title[^>]*>([^<]{0,200})</title>", low[:200000])
     if title and any(t in title.group(1) for t in _WALL_TITLES):
+        return True
+    if any(p in low for p in _WALL_PHRASES):
         return True
     return len(low) <= 60000 and any(m in low for m in _BLOCK_MARKERS)
 
