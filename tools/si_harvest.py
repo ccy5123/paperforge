@@ -147,6 +147,7 @@ _WEB_EXTS = {"html", "htm", "php", "asp", "aspx", "jsp", "do", "cgi", "action", 
 _SI_URL_RE = re.compile("|".join([
     r"/suppl_file/",                              # Atypon: ACS, T&F, SAGE, CSP, Science, PNAS
     r"/action/downloadSupplement\b",              # Wiley Online Library
+    r"[-_]sup-\d{4}[-_.]",                        # Wiley SI file names (etc3152-sup-0001-...), also on OUP
     r"/suppdata/",                                # RSC (before its 2026 move to Silverchair)
     r"/article-supplement/\d+/",                  # Silverchair: RSC, OUP
     r"static-content\.springer\.com/esm/",        # Springer Nature ESM
