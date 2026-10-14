@@ -179,6 +179,11 @@ def test_detect_ext_prefers_server_name_then_url_then_bytes():
     ("https://media.springernature.com/original/springer-static/esm/art%3A10.1007%2Fs11356-024-"
      "32658-7/MediaObjects/11356_2024_32658_MOESM1_ESM.docx", "Supplementary file1 (DOCX 1181 KB)", True),
     ("https://example.org/files/table.xlsx", "Supporting Information", True),
+    # Wiley's SI file names, also on OUP's copies of ET&C; the link text is just the title
+    ("https://oup.silverchair-cdn.com/oup/backfile/Content_public/Journal/etc/35/1/10.1002_etc.3152/6/"
+     "etc3152-sup-0001-suppdata-s1.docx?Expires=1794983843&Signature=WY4v",
+     "etc3152-sup-0001-SuppData-S1 Acute and chronic toxicity of neonicotinoids to nymphs of a "
+     "mayfly species and some notes on seasonal differences. - docx file", True),
     # IOP's /data page links signed S3 copies named <journal><id>supp<n>
     ("https://cfn-live-content-bucket-iop-org.s3.eu-west-1.amazonaws.com/journals/1748-9326/19/5/"
      "054002/revision2/erlad3a81supp1.pdf?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20261013T110901Z",
