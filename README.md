@@ -157,6 +157,97 @@ Only on `download` and `all` (they govern the PDF phase):
 | `--overwrite` | re-download DOIs already recorded as success |
 | `--no-metadata` | skip the OpenAlex/Crossref lookup used to name files |
 
+## Supporting Information → one zip (`tools/si_harvest.py`)
+
+A standalone script, independent of the `paperforge` package, that finds the
+**Supporting Information** of every DOI, downloads it, and bundles it all into
+one flat zip with a manifest:
+
+```bash
+python tools/si_harvest.py dois.txt --email you@example.org -o si_out
+```
+
+```
+si_out/
+  files/Smith2012_SI1.pdf, Smith2012_SI2.xlsx, Konemann2018_SI1.pdf, ...
+  si_manifest.csv     # doi, stem, status, file, source, original_name, url, bytes, sha256, note
+  SI.zip              # the files, flat, plus si_manifest.csv
+  retry.txt           # DOIs that were blocked or unreachable: rerun with this file as input
+  debug/              # the HTML a site sent instead of a page or file
+  .metadata_cache.json  # Crossref answers, so a rerun does not ask again
+```
+
+Inputs are the same kinds as above (`.txt`, `.csv`/`.tsv`, `.xlsx`, bare
+DOIs). Files are named `<Surname><Year>_SI<n>.<ext>`, with `a`/`b`/… on
+collisions. Runs resume: a DOI already harvested is skipped next time, and
+blocked, failed or empty DOIs are retried; `retry.txt` can be the next run's
+input. Within a run, DOIs left blocked or unreachable get another pass with a
+fresh browser once the rest are done (`--retries`, default 1). `SI.zip` always
+holds everything harvested into the output directory.
+
+For a DOI that ends with no SI, the manifest's `note` says what each route
+gave, for example `checked mirrors: nothing; https://… opened, no SI links;
+probes (Elsevier mmc): nothing`. That separates "the pages list no SI" from
+"the pages never opened".
+
+For each DOI it works through these routes, cheapest first:
+
+1. **APIs and open mirrors**: figshare (ACS, T&F, SAGE and PLOS mirror their
+   SI there), the PMC open-access bucket on AWS (the files the article's PMC
+   XML lists as supplementary material), the Elsevier Object API, and
+   Zenodo/figshare deposits that DataCite or Crossref record as supplementing
+   the article. The Elsevier API (`--elsevier-key` or `$ELSEVIER_API_KEY`)
+   lists an article's objects; its `mmcN` files are the SI, fetched from
+   `ars.els-cdn.com`. An article it lists with no `mmcN` file is recorded as
+   having no SI; no URLs are probed and the browser is not started for it. In
+   October 2026 the API returned the same empty list for a 1980 article and
+   for a PII that does not exist, so an empty list decides nothing.
+2. **Publisher pages**: the landing page plus known SI pages (Atypon
+   `/doi/suppl/`, Wiley `/doi/full/`, IOP `/data`, ScienceDirect, bioRxiv,
+   PMC), scanned for SI links (ACS, Wiley, Springer Nature, Elsevier, PLOS,
+   RSC, MDPI, Frontiers, OUP, ChemRxiv, Copernicus, IOP, …). Links that carry another article's DOI (the
+   SI of a cited paper in the reference list) are skipped.
+3. **URL probing**, when nothing complete has turned up yet: Elsevier
+   `ars.els-cdn.com/…-mmcN`, PLOS `.s00N`.
+4. **A real browser**, for pages and files behind Cloudflare and similar
+   walls. Needs `pip install playwright && playwright install chromium`. A file
+   the page cannot fetch is opened in its own tab, as a click would, and taken
+   from the browser's download (the profile is set to download PDFs rather
+   than display them). The browser runs without a window and ticks a
+   Cloudflare Turnstile or hCaptcha box itself; whether that passes is the
+   site's decision. A check still standing after that (in October 2026, IOP's
+   hCaptcha answered the tick with a picture puzzle) is reopened in a visible
+   window for you to pass; the window closes as soon as you are through, or
+   after 3 minutes. If nobody passes anything in a window, no further window
+   opens in that run and the DOI goes to `retry.txt`. `--browser headless`
+   never opens a window; `--browser show` does everything in one, which also
+   lets you log in through your institution once. The profile
+   (`--browser-profile`) keeps the cookies a passed check leaves.
+
+With `pip install curl_cffi`, publisher requests present Chrome's TLS
+fingerprint; in October 2026 that got figshare downloads, Wiley, Canadian
+Science Publishing and link.springer.com pages through without a browser. A
+host that refuses it is retried over plain `requests`. A host that has
+refused every client tried, twice in a row, is not asked again over plain
+HTTP in that pass; its pages and files go straight to the browser.
+
+Downloads that come back as HTML (a login wall or bot check) are never saved
+as SI. A file reached by two routes is kept once: same bytes, or same file
+name (publishers stamp the copy they serve, so it differs from a mirror's).
+
+| Flag | Meaning |
+| --- | --- |
+| `--browser auto\|headless\|show\|off` | real-browser fallback (default `auto`: headless, plus a window only for a check that needs a person) |
+| `--cookies FILE` | Netscape `cookies.txt` exported from a logged-in browser |
+| `--elsevier-key KEY` | Elsevier API key (or `$ELSEVIER_API_KEY`) |
+| `--delay SEC` | min gap between requests to one publisher host (default 1.0) |
+| `--pause MIN MAX` | random pause between two DOIs (default 2 4) |
+| `--no-impersonate` | plain `requests` even when `curl_cffi` is installed |
+| `--max-mb N` | skip files larger than N MB (default 200) |
+| `--skip-ext EXTS` | file types not to download, comma-separated (e.g. `mp4,avi,h5`) |
+| `--retries N` | extra passes over DOIs left blocked or unreachable (default 1) |
+| `--no-probe` / `--overwrite` / `--zip NAME` | no URL guessing / re-harvest everything / zip file name |
+
 ## Library use
 
 ```python
