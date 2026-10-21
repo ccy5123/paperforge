@@ -11,6 +11,7 @@ import importlib.util
 import io
 import json
 import socket
+import shutil
 import sys
 import threading
 import zipfile
@@ -786,6 +787,37 @@ def test_no_window_without_a_screen(tmp_path, fake_browser, monkeypatch):
     assert rows["10.5555/a"]["status"] == "blocked"
 
 
+class DyingBrowser(FakeBrowser):
+    """Chromium exits while serving DOI a."""
+
+    def open(self, url):
+        if "10.5555/a" in url:
+            raise RuntimeError("BrowserContext.new_page: Target page, context or browser has been closed")
+        return super().open(url)
+
+
+def test_a_crash_in_one_doi_does_not_end_the_run(tmp_path, fake_browser, monkeypatch):
+    monkeypatch.setattr(si, "BrowserSession", DyingBrowser)
+    rows = run_walled(tmp_path, ["10.5555/a", "10.5555/b"], browser="headless")
+    assert (rows["10.5555/a"]["status"], rows["10.5555/b"]["status"]) == ("error", "blocked")
+    assert "RuntimeError" in rows["10.5555/a"]["note"]
+    assert len(fake_browser.made) == 2          # b gets a fresh browser
+    assert "10.5555/a" in (tmp_path / "out" / "retry.txt").read_text()
+
+
+def test_a_crashed_doi_leaves_no_partial_files(tmp_path):
+    h, _ = make_harvester(tmp_path, walled_routes("10.5555/a"), probe=False, retries=0)
+
+    def save_one_then_crash(job, pages=True):
+        h._store(job, PDF, source="page", url=FakeBrowser.SI, names=["x.pdf"], complete=False)
+        raise RuntimeError("Target page, context or browser has been closed")
+    h._browser_pass = save_one_then_crash
+    h.run(["10.5555/a"])
+    rows = read_manifest((tmp_path / "out" / "si_manifest.csv").read_text())
+    assert [r["status"] for r in rows] == ["error"]
+    assert list((tmp_path / "out" / "files").iterdir()) == []
+
+
 def test_skipped_file_types_are_not_downloaded_or_kept(tmp_path):
     mp4 = b"\x00\x00\x00\x18ftypmp42 video"
     h, session = make_harvester(tmp_path, {
@@ -821,7 +853,7 @@ def test_unreachable_publisher_is_an_error_not_none(tmp_path):
     })
     summary = h.run([NONE])
     assert summary.errors == [NONE] and summary.none == []
-    assert "Network errors (1; rerun to retry)" in summary.text()
+    assert "Errors (1; rerun to retry)" in summary.text()
 
 
 def test_publisher_requests_impersonate_and_fall_back_per_host(tmp_path):
@@ -1021,6 +1053,10 @@ class _ChallengeSite(BaseHTTPRequestHandler):
                                        b"'clear=1; path=/'; location.reload()})</script></body></html>",
                                   "text/html")
             return self._landing()
+        if path == "/stale":              # a clearance cookie from another browser keeps the wall up
+            if "cf_clearance=stale" in (self.headers.get("Cookie") or ""):
+                return self._send(403, CHALLENGE, "text/html")
+            return self._landing()
         if path == "/altcha":             # proof-of-work box: tick it, then the form submits
             if not cleared:
                 return self._send(200, b"<html><body><form method='get' action='/altcha'>"
@@ -1119,6 +1155,37 @@ def test_browser_waits_out_ddos_guard_and_ticks_altcha(tmp_path, challenge_site,
     assert [u.rsplit("/", 1)[-1] for u in si.si_links(page_)] == list(SI_NAMES)
 
 
+@needs_chromium
+def test_browser_starts_again_after_chromium_closes(tmp_path, challenge_site):
+    browser = si.BrowserSession(tmp_path / "profile")
+    browser.start()
+    try:
+        browser.open(challenge_site + "/landing")
+        browser._ctx.close()                      # as when Chromium exits mid-run
+        f = browser.fetch(f"{challenge_site}/doi/suppl/10.5555/t/suppl_file/t_si_inline.pdf",
+                          challenge_site + "/landing", 10**8)
+    finally:
+        browser.close()
+    assert (f.status, f.content) == (200, PDF_INLINE)
+
+
+@needs_chromium
+@pytest.mark.skipif(not shutil.which("Xvfb"), reason="Xvfb not installed")
+def test_hidden_browser_is_an_ordinary_chromium_on_a_virtual_display(tmp_path, challenge_site):
+    """Cloudflare's managed check turns headless Chromium away; on Xvfb the browser is
+    not headless, and still no window reaches the desktop."""
+    browser = si.BrowserSession(tmp_path / "profile")
+    browser.start()
+    xvfb = browser._xvfb
+    try:
+        page_ = browser.open(challenge_site + "/landing")
+        ua = browser._first_page().evaluate("navigator.userAgent")
+    finally:
+        browser.close()
+    assert xvfb is not None and xvfb.poll() is not None          # stopped with the browser
+    assert page_ is not None and not page_.blocked and "Headless" not in ua
+
+
 TURNSTILE_BOX = ("<html><body style='margin:0'><input type='checkbox' style='position:absolute;"
                  "left:15px;top:17px;width:30px;height:30px' onclick=\"parent.postMessage('ok', '*')\">"
                  "</body></html>")
@@ -1138,6 +1205,62 @@ def test_browser_ticks_a_turnstile_box(tmp_path, challenge_site):
         browser.close()
     assert clicks and page_ is not None and not page_.blocked
     assert [u.rsplit("/", 1)[-1] for u in si.si_links(page_)] == list(SI_NAMES)
+
+
+@needs_chromium
+def test_a_window_closed_by_the_person_is_skipped_not_reopened(tmp_path, challenge_site):
+    browser = si.BrowserSession(tmp_path / "profile")
+    browser.start()
+    browser.show = True                           # stands for the window, without one
+    try:
+        browser._ctx.close()                      # the person closes it
+        page_ = browser.open(challenge_site + "/landing")
+        f = browser.fetch(challenge_site + "/doi/suppl/10.5555/t/suppl_file/t_si_001.pdf",
+                          None, 10**8)
+        ctx = browser._ctx
+    finally:
+        browser.close()
+    assert page_ is None and si.reject_reason(f) and ctx is not None and ctx.pages == []
+
+
+# Cloudflare answers the first tick with a fresh box; the second gets through.
+TURNSTILE_BOX_TWICE = ("<html><body style='margin:0'><input type='checkbox' style='position:absolute;"
+                       "left:15px;top:17px;width:30px;height:30px' onclick=\"const n = +(localStorage.n "
+                       "|| 0) + 1; localStorage.n = n; n > 1 ? parent.postMessage('ok', '*') : "
+                       "location.reload()\"></body></html>")
+
+
+@needs_chromium
+def test_browser_ticks_again_after_a_rejected_tick(tmp_path, challenge_site):
+    browser = si.BrowserSession(tmp_path / "profile")
+    browser._TICK_AGAIN = 1.0
+    browser.start()
+    clicks = []
+    browser._ctx.route("https://challenges.cloudflare.com/**", lambda route: (
+        clicks.append(route.request.url),
+        route.fulfill(status=200, content_type="text/html", body=TURNSTILE_BOX_TWICE)))
+    try:
+        page_ = browser.open(challenge_site + "/turnstile")
+    finally:
+        browser.close()
+    assert len(clicks) >= 2 and page_ is not None and not page_.blocked
+
+
+@needs_chromium
+def test_browser_drops_a_stale_cloudflare_cookie(tmp_path, challenge_site, monkeypatch):
+    browser = si.BrowserSession(tmp_path / "profile")
+    monkeypatch.setattr(browser, "_deadline", lambda: si.time.monotonic() + 2)
+    browser.start()
+    browser._ctx.add_cookies([{"name": "cf_clearance", "value": "stale", "url": challenge_site},
+                              {"name": "session", "value": "keep", "url": challenge_site}])
+    try:
+        page_ = browser.open(challenge_site + "/stale")
+        left = {c["name"] for c in browser._ctx.cookies()}
+    finally:
+        browser.close()
+    assert page_ is not None and not page_.blocked
+    assert [u.rsplit("/", 1)[-1] for u in si.si_links(page_)] == list(SI_NAMES)
+    assert left == {"session"}      # only Cloudflare's cookies go
 
 
 @needs_chromium

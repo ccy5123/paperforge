@@ -29,8 +29,10 @@ Discovery, per DOI, cheap and reliable routes first:
   3. URL probing, if nothing complete yet: predictable SI locations
      (Elsevier ``ars.els-cdn.com/...-mmcN``, PLOS ``.s00N``).
   4. A real browser, if still nothing: blocked pages (Cloudflare and co.) are
-     reopened in a headless Chromium via Playwright, which ticks a Turnstile or
-     hCaptcha box itself, and the SI is fetched inside that browser session. A
+     reopened in a hidden Chromium via Playwright, which ticks a Turnstile or
+     hCaptcha box itself, and the SI is fetched inside that browser session.
+     With Xvfb installed, "hidden" is an ordinary Chromium on a virtual display
+     (Cloudflare turns headless Chromium away); without it, headless. A
      check still standing (a picture puzzle) is reopened in a visible window for
      a person; ``--browser headless`` never opens one, ``--browser show`` does
      everything in a window. The profile keeps the cookies a passed check leaves.
@@ -55,7 +57,10 @@ import mimetypes
 import os
 import random
 import re
+import shutil
+import socket
 import string
+import subprocess
 import sys
 import time
 import unicodedata
@@ -816,6 +821,10 @@ class BrowserSession:
     # puzzle, left to a person). (host, part of the frame URL)
     _CHECKBOX_FRAMES = (("challenges.cloudflare.com", "/turnstile/"), ("hcaptcha.com", "frame=checkbox"))
     _TICK_AFTER = 3.0   # seconds a check is left to clear by itself before the tick
+    # Cloudflare answers a tick it did not like with a fresh box (~15 s later), not a
+    # refusal: tick again, a few times.
+    _TICK_AGAIN, _TICKS = 12.0, 3
+    _CF_COOKIE = re.compile(r"^(?:cf_|__cf)")
 
     # A viewer page that wraps the file rather than serving it: where the file is.
     _EMBEDDED_JS = r"""() => {
@@ -842,10 +851,14 @@ class BrowserSession:
         self.user_agent: Optional[str] = None
         self._pw = None
         self._ctx = None
+        self._xvfb: Optional[subprocess.Popen] = None
+        self._display = ""                # the virtual display a hidden browser draws on
+        self._lost = False                # Chromium exited under us
         self._pages: dict[str, Any] = {}
         self._altcha_ticked: set[tuple[int, str]] = set()
-        # (page, URL) -> when a check was first seen there; None once its box is ticked
-        self._check_seen: dict[tuple[int, str], Optional[float]] = {}
+        # (page, URL) -> [when its box may be ticked next, ticks so far]
+        self._check_seen: dict[tuple[int, str], list] = {}
+        self._forgot: set[str] = set()    # hosts whose Cloudflare cookies were dropped
 
     @staticmethod
     def installed() -> bool:
@@ -859,6 +872,8 @@ class BrowserSession:
         from playwright.sync_api import sync_playwright
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         self._download_pdfs()
+        if not self.show:
+            self._start_xvfb()
         self._pw = sync_playwright().start()
         try:
             self._ctx = self._launch(None)
@@ -868,9 +883,53 @@ class BrowserSession:
                 self._ctx.close()
                 self._ctx = self._launch(ua)
             self.user_agent = ua
+            self._lost = False
+            self._ctx.on("close", lambda _: setattr(self, "_lost", True))
         except Exception:
             self.close()
             raise
+
+    def _start_xvfb(self) -> None:
+        """Cloudflare's managed check (RSC, ACS) fails headless Chromium even after its
+        box is ticked, and passes an ordinary one. Xvfb gives an ordinary Chromium a
+        screen nobody sees; without Xvfb the browser stays headless."""
+        exe = shutil.which("Xvfb")
+        if not exe or not sys.platform.startswith("linux"):
+            return
+        # A display number of our own: WSLg mounts /tmp/.X11-unix read-only, and there
+        # Xvfb's -displayfd gives up instead of falling back to its abstract socket.
+        for n in range(99, 130):
+            if os.path.exists(f"/tmp/.X{n}-lock"):
+                continue
+            try:
+                proc = subprocess.Popen([exe, f":{n}", "-screen", "0", "1920x1080x24",
+                                         "-nolisten", "tcp"], stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL)
+            except OSError as e:
+                log.debug("  browser: Xvfb did not start (%s); headless", e)
+                return
+            if self._x_ready(n, proc):
+                self._xvfb, self._display = proc, f":{n}"
+                log.debug("  browser: on Xvfb display %s", self._display)
+                return
+            proc.kill()
+            proc.wait()
+        log.debug("  browser: no Xvfb display came up; headless")
+
+    @staticmethod
+    def _x_ready(n: int, proc: subprocess.Popen, timeout: float = 5.0) -> bool:
+        """Has Xvfb on display ``n`` come up (rather than exited: display taken)?"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and proc.poll() is None:
+            for address in (f"\0/tmp/.X11-unix/X{n}", f"/tmp/.X11-unix/X{n}"):
+                with socket.socket(socket.AF_UNIX) as sock:
+                    try:
+                        sock.connect(address)
+                        return True
+                    except OSError:
+                        pass
+            time.sleep(0.1)
+        return False
 
     def _download_pdfs(self) -> None:
         """A PDF Chromium shows in its viewer reaches Playwright as the viewer's HTML,
@@ -887,13 +946,17 @@ class BrowserSession:
         path.write_text(json.dumps(prefs), encoding="utf-8")
 
     def _launch(self, user_agent: Optional[str]):
-        kw: dict = dict(headless=not self.show, accept_downloads=True, locale="en-US",
-                        args=["--disable-blink-features=AutomationControlled"])
+        kw: dict = dict(headless=not (self.show or self._display), accept_downloads=True,
+                        locale="en-US", args=["--disable-blink-features=AutomationControlled"])
         if user_agent:
             kw["user_agent"] = user_agent
+        if self._display:   # X11 on the virtual display, never the desktop's Wayland
+            kw["env"] = {k: v for k, v in os.environ.items() if k != "WAYLAND_DISPLAY"}
+            kw["env"]["DISPLAY"] = self._display
+            kw["args"] += ["--ozone-platform=x11", "--window-size=1920,1080"]
         if os.environ.get("SI_CHROMIUM"):
             kw["executable_path"] = os.environ["SI_CHROMIUM"]
-        elif not self.show:
+        elif kw["headless"]:
             # Chromium's new headless mode: the full browser, without a window. Playwright's
             # default headless shell says "HeadlessChrome" in Sec-CH-UA even under a UA
             # override, and Cloudflare and Akamai turn it away.
@@ -920,7 +983,7 @@ class BrowserSession:
         return self._pages[origin]
 
     def cookies(self) -> list[dict]:
-        return self._ctx.cookies() if self._ctx else []
+        return self._ctx.cookies() if self._ctx and not self._lost else []
 
     def _challenged(self, page) -> bool:
         """Is the page a bot check right now? Ticks an Altcha, Turnstile or hCaptcha
@@ -938,11 +1001,11 @@ class BrowserSession:
         return blocked
 
     def _tick_checkbox(self, page) -> None:
-        """Click a Turnstile or hCaptcha box once per page URL, as a person would: the
-        mouse on the box, which lives in a cross-origin frame. The site still decides."""
+        """Click a Turnstile or hCaptcha box as a person would: the mouse on the box,
+        which lives in a cross-origin frame. The site still decides."""
         key = (id(page), page.url)
-        first = self._check_seen.setdefault(key, time.monotonic())
-        if first is None or time.monotonic() - first < self._TICK_AFTER:
+        seen = self._check_seen.setdefault(key, [time.monotonic() + self._TICK_AFTER, 0])
+        if seen[1] >= self._TICKS or time.monotonic() < seen[0]:
             return
         for frame in page.frames:
             if not any(host in frame.url and part in frame.url for host, part in self._CHECKBOX_FRAMES):
@@ -951,12 +1014,29 @@ class BrowserSession:
                 box = frame.frame_element().bounding_box()
                 if not box or box["width"] < 50:   # not drawn yet: next poll
                     return
-                self._check_seen[key] = None
+                seen[:] = [time.monotonic() + self._TICK_AGAIN, seen[1] + 1]
                 page.mouse.click(box["x"] + 30, box["y"] + box["height"] / 2)
                 log.debug("  browser: ticked the check box on %s", page.url)
             except Exception as e:
                 log.debug("  browser: could not tick the check box: %s", e)
             return
+
+    def _forget_clearance(self, url: str) -> bool:
+        """Cloudflare cookies earned by another browser (the headless one, a window) keep
+        a check standing for this one even when it would pass afresh. Drop a site's
+        once per session; True if there were any."""
+        host = (urlparse(url).hostname or "").lower()
+        if host in self._forgot:
+            return False
+        self._forgot.add(host)
+        stale = [c for c in self._ctx.cookies() if self._CF_COOKIE.match(c["name"])
+                 and ("." + host).endswith("." + c["domain"].lstrip("."))]
+        for c in stale:
+            self._ctx.clear_cookies(name=c["name"], domain=c["domain"])
+        if stale:
+            log.debug("  browser: still walled; dropped %d Cloudflare cookie(s) of %s",
+                      len(stale), host)
+        return bool(stale)
 
     def _tick_altcha(self, page) -> None:
         key = (id(page), page.url)
@@ -969,28 +1049,63 @@ class BrowserSession:
             page.evaluate(self._ALTCHA_CLICK_JS)
 
     def _deadline(self) -> float:
-        return time.monotonic() + (180 if self.show else 25)
+        return time.monotonic() + (180 if self.show else 60)   # hidden: room for 3 ticks
 
     def _warn_once(self, warned: bool, url: str) -> bool:
         if self.show and not warned:
             log.warning("  browser: pass the check in the open window: %s", url)
         return True
 
-    def open(self, url: str) -> Optional[PageLinks]:
-        page = self._page_for(url)
-        for attempt in range(2):   # a challenge redirecting mid-load can abort the first goto
+    def _retry_if_lost(self, call, gone):
+        """Chromium can exit mid-run (a crash, low memory). Start it again on the same
+        profile, and give the call that met the closed browser one more go. A window
+        closed by the person in front of it means "skip": ``gone`` is returned."""
+        if self.show:
+            if self._lost:
+                return gone
             try:
-                page.goto(url, wait_until="domcontentloaded", timeout=45_000)
-                break
+                return call()
             except Exception as e:
-                log.debug("  browser: could not open %s: %s", url, str(e).splitlines()[0])
-                if attempt:
-                    return None
-                page.wait_for_timeout(2000)
-        deadline, warned = self._deadline(), False
-        while (blocked := self._challenged(page)) and time.monotonic() < deadline:
-            warned = self._warn_once(warned, url)
-            page.wait_for_timeout(1000)
+                if not (self._lost or "closed" in str(e)):
+                    raise
+                log.warning("  browser: window closed; skipping what is left in it")
+                self._lost = True
+                return gone
+        for attempt in range(2):
+            if self._lost:
+                log.warning("  browser: Chromium closed; starting it again")
+                self.close()
+                self.start()
+            try:
+                return call()
+            except Exception:
+                if attempt or not self._lost:
+                    raise
+
+    def open(self, url: str) -> Optional[PageLinks]:
+        return self._retry_if_lost(lambda: self._open(url), None)
+
+    def _open(self, url: str) -> Optional[PageLinks]:
+        page = self._page_for(url)
+        if self.show:   # a window opens where the hidden browser failed: its cookies, too
+            self._forget_clearance(url)
+        for fresh in (False, True):
+            for attempt in range(2):   # a challenge redirecting mid-load can abort the first goto
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+                    break
+                except Exception as e:
+                    log.debug("  browser: could not open %s: %s", url, str(e).splitlines()[0])
+                    if attempt:
+                        return None
+                    page.wait_for_timeout(2000)
+            deadline, warned = self._deadline(), False
+            while (blocked := self._challenged(page)) and time.monotonic() < deadline:
+                warned = self._warn_once(warned, url)
+                page.wait_for_timeout(1000)
+            if not blocked or fresh or not self._forget_clearance(page.url):
+                break
+            self._check_seen = {k: v for k, v in self._check_seen.items() if k[0] != id(page)}
         try:
             page.wait_for_load_state("networkidle", timeout=8_000)
         except Exception:
@@ -1008,9 +1123,13 @@ class BrowserSession:
                          pdf_urls=set(pdfs), blocked=blocked)
 
     def fetch(self, url: str, referer: Optional[str], max_bytes: int) -> Fetched:
+        return self._retry_if_lost(lambda: self._fetch(url, referer, max_bytes),
+                                   Fetched(url=url, status=0, error="browser window closed"))
+
+    def _fetch(self, url: str, referer: Optional[str], max_bytes: int) -> Fetched:
         origin = _origin(url)
         if origin not in self._pages and referer and _origin(referer) == origin:
-            self.open(referer)
+            self._open(referer)
         page = self._pages.get(origin)
         if page is not None:
             try:
@@ -1035,6 +1154,8 @@ class BrowserSession:
             return Fetched(url=resp.url, status=resp.status,
                            headers=CaseInsensitiveDict(resp.headers), content=resp.body())
         except Exception as e:
+            if self._lost:   # Chromium went mid-download: let fetch() start it and retry
+                raise
             return Fetched(url=url, status=0, error=f"browser: {e}")
 
     def _navigate(self, url: str, max_bytes: int, depth: int = 0) -> Optional[Fetched]:
@@ -1105,7 +1226,15 @@ class BrowserSession:
                 except Exception:
                     pass
         self._ctx = self._pw = None
-        self._pages = {}
+        self._pages, self._forgot = {}, set()
+        if self._xvfb is not None:
+            self._xvfb.terminate()
+            try:
+                self._xvfb.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._xvfb.kill()
+                self._xvfb.wait()
+        self._xvfb, self._display = None, ""
 
 
 # ============================================================
@@ -1158,7 +1287,7 @@ class Job:
     pmcid: str = ""                      # set when PMC has the article but not in its open bucket
     complete: bool = False
     blocked: bool = False
-    failed: bool = False                 # the publisher was unreachable (network error)
+    failed: bool = False                 # the publisher was unreachable, or the harvest crashed
 
     def note(self, message: str) -> None:
         if message not in self.notes:
@@ -1301,7 +1430,7 @@ class Harvester:
         self._write_manifest(manifest)
         log.info("  = %s", {"ok": f"{len(job.files)} SI file(s)",
                             "blocked": "blocked, no SI saved",
-                            "error": "network error, no SI saved",
+                            "error": "error, no SI saved",
                             "none": "no SI found"}[job.status])
 
     def close(self) -> None:
@@ -1328,6 +1457,22 @@ class Harvester:
 
     def harvest(self, doi: str, stem: str, meta: Meta) -> Job:
         job = Job(doi=doi, stem=stem)
+        try:
+            self._harvest(job, meta)
+        except Exception as e:   # one DOI must not end the run; retry.txt gets it
+            log.warning("  harvest failed: %s", _short_error(e))
+            for f in job.files:          # a partial set would pass for the whole one
+                (self.files_dir / f.filename).unlink(missing_ok=True)
+            del job.files[:]
+            job.failed = True
+            job.note(f"harvest failed: {_short_error(e)}")
+            if self._browser is not None:   # the browser may be what broke: a fresh one next
+                self._browser.close()
+                self._browser = None
+        return job
+
+    def _harvest(self, job: Job, meta: Meta) -> None:
+        doi = job.doi
 
         # 1. APIs and open mirrors.
         for name, source in (("figshare", self.src_figshare), ("pmc", self.src_pmc),
@@ -1360,7 +1505,6 @@ class Harvester:
         self._browser_pass(job, pages=not job.complete)
         if not job.files:
             job.explain()
-        return job
 
     def _scan_page(self, job: Job, page_url: str, f: Fetched) -> None:
         blocked = looks_blocked(f.status, f.text, f.headers)
@@ -1906,7 +2050,7 @@ class Summary:
             lines.append(f"Blocked ({len(self.blocked)}; try --browser show, or --cookies "
                          f"from a logged-in browser): " + ", ".join(self.blocked))
         if self.errors:
-            lines.append(f"Network errors ({len(self.errors)}; rerun to retry): "
+            lines.append(f"Errors ({len(self.errors)}; rerun to retry): "
                          + ", ".join(self.errors))
         if self.none:
             lines.append(f"No SI found ({len(self.none)}): " + ", ".join(self.none))
@@ -1930,8 +2074,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "(or $SI_EMAIL / $UNPAYWALL_EMAIL)")
     p.add_argument("--browser", choices=("auto", "headless", "show", "off"), default="auto",
                    help="real-browser fallback for blocked pages (needs playwright): auto = "
-                        "headless, plus a window only for a check that needs a person; "
-                        "headless = never a window; show = always a window; off")
+                        "hidden (on an Xvfb virtual display if installed, else headless), plus "
+                        "a window only for a check that needs a person; headless = never a "
+                        "window; show = always a window; off")
     p.add_argument("--browser-profile", default=None,
                    help="persistent Chromium profile (default: ~/.cache/si_harvest/browser-profile)")
     p.add_argument("--cookies", default=None,
